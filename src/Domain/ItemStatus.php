@@ -32,7 +32,8 @@ enum ItemStatus: string
             self::Sold => [],
             self::Withdrawn => [self::Available],
             self::SyncMissing => [self::Available, self::Withdrawn],
-            self::Blocked => [self::Available],
+            // Разблокировка администратором — тоже в цель освобождения по source_status (releaseTarget()).
+            self::Blocked => [self::Available, self::SyncMissing, self::Withdrawn],
         };
     }
 
@@ -67,7 +68,7 @@ enum ItemStatus: string
     }
 
     /**
-     * Целевой статус при освобождении (резерв снят / заказ не оплачен):
+     * Целевой статус при освобождении (резерв снят / заказ не оплачен / экземпляр разблокирован):
      * CASE source_status WHEN 'present' THEN 'available' WHEN 'missing' THEN 'sync_missing'
      * WHEN 'withdrawn' THEN 'withdrawn' END.
      */

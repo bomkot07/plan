@@ -38,6 +38,10 @@ final class MarcExtractor
 
     private const UNTITLED = '[Без заглавия]';
 
+    /** Допустимый год публикации (CHECK wp_book_records_chk_year): вне диапазона — NULL, а не ошибка 3819 пакета. */
+    public const YEAR_MIN = 1400;
+    public const YEAR_MAX = 2100;
+
     /** Длины колонок схемы (символы для VARCHAR, байты для TEXT). */
     private const LEN = [
         'title' => 1000, 'title_sort' => 255, 'subtitle' => 1000, 'responsibility_statement' => 1000,
@@ -400,7 +404,7 @@ final class MarcExtractor
             }
         }
         $dateText = $dateText !== null ? self::nullIfEmpty(rtrim(self::squash($dateText), ' .,;:')) : null;
-        $year = self::extractYear($dateText) ?? self::yearFrom008($f008);
+        $year = self::yearInRange(self::extractYear($dateText)) ?? self::yearFrom008($f008);
 
         // --- 250, 041/008, 300, 490/830 ---------------------------------------------------------
         $f250 = self::first($fields, '250');
@@ -540,14 +544,20 @@ final class MarcExtractor
     }
 
     /**
-     * Год из 264$c / 260$c: '[1905?]' → 1905, 'c1999' → 1999, '1890-1895' → 1890, 'MDCCCXII' → null.
-     * `\b` не годится: в 'c1999' между 'c' и '1' нет границы слова.
+     * Год из 264$c / 260$c: '[1905?]' → 1905, 'c1999' → 1999, '1890-1895' → 1890, 'MDCCCXII' → null,
+     * '1350' / '2150' → null (вне YEAR_MIN..YEAR_MAX). `\b` не годится: в 'c1999' между 'c' и '1' нет границы слова.
      */
     public static function extractYear(?string $dateText): ?int
     {
-        return $dateText !== null && preg_match('/(?<!\d)(1[4-9]\d{2}|20\d{2})(?!\d)/', $dateText, $m) === 1
-            ? (int) $m[1]
+        return $dateText !== null && preg_match('/(?<!\d)(1[4-9]\d{2}|20\d{2}|2100)(?!\d)/', $dateText, $m) === 1
+            ? self::yearInRange((int) $m[1])
             : null;
+    }
+
+    /** Год вне YEAR_MIN..YEAR_MAX → NULL: CHECK wp_book_records_chk_year иначе сорвал бы запись (3819). */
+    public static function yearInRange(?int $year): ?int
+    {
+        return $year !== null && $year >= self::YEAR_MIN && $year <= self::YEAR_MAX ? $year : null;
     }
 
     /**
@@ -748,8 +758,8 @@ final class MarcExtractor
         $ids = [];
         $isbnPrimary = null;
         $add = static function (string $type, ?string $value, ?string $raw, bool $cancelled) use (&$ids): void {
-            if ($value === null || $value === '' || \strlen($value) > 64 || preg_match('/^[\x21-\x7E]+$/', $value) !== 1) {
-                return; // колонка id_value — ascii VARCHAR(64): не-ASCII дал бы 1366 и сорвал бы пакет
+            if ($value === null || $value === '' || mb_strlen($value) > 64 || preg_match('/^[^\p{C}\s]+$/u', $value) !== 1) {
+                return; // id_value — VARCHAR(64) utf8mb4_bin: длиннее, с пробелами или управляющими символами — не идентификатор
             }
             $k = $type . '|' . $value;
             if (isset($ids[$k])) {
@@ -849,7 +859,7 @@ final class MarcExtractor
         return null;
     }
 
-    /** 008/07–10 (Date1), если 008/06 не b/n/| и Date1 — четыре цифры в диапазоне CHECK ck_records_year. */
+    /** 008/07–10 (Date1), если 008/06 не b/n/| и Date1 — четыре цифры в диапазоне YEAR_MIN..YEAR_MAX. */
     private static function yearFrom008(?string $f008): ?int
     {
         if ($f008 === null || \strlen($f008) < 11 || \in_array($f008[6], ['b', 'n', '|'], true)) {
@@ -859,9 +869,7 @@ final class MarcExtractor
         if (preg_match('/^\d{4}$/', $date1) !== 1) {
             return null; // 19uu, '    ' и т. п.
         }
-        $year = (int) $date1;
-
-        return $year >= 1400 && $year <= 2100 ? $year : null;
+        return self::yearInRange((int) $date1);
     }
 
     /** 041$a (первые 3 символа), при ind2 = 7 (не коды MARC) или без 041 — 008/35–37. */

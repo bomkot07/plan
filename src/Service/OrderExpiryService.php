@@ -14,32 +14,32 @@ use Uniundata\Books\Payment\PaymentProviderInterface;
  * Для каждого просроченного заказа:
  *  1. ВНЕ транзакции спрашиваем банк о каждой открытой попытке (created/pending/processing):
  *     succeeded → PaymentService::applyProviderResult() (заказ станет paid, освобождать нечего);
- *     processing → applyProviderResult() + однократное продление на grace и needs_attention.
+ *     processing → applyProviderResult() + однократное продление на grace (orders.payment_due_extended_at)
+ *     и needs_attention.
  *  2. Транзакция items (asc) → order → payments: перепроверка (заказ всё ещё открыт и просрочен, успешных
- *     платежей нет), затем order → payment_expired, платежи → expired, экземпляры checkout_pending этого
- *     заказа → release target.
+ *     платежей нет), затем order → payment_expired, платежи created|pending|processing → expired,
+ *     экземпляры checkout_pending этого заказа → release target.
  *  3. После COMMIT — cancelSession у банка (best effort). Если деньги всё-таки придут — ветка позднего платежа.
  *
  * Гонка с webhook: обе стороны блокируют items → order; кто второй, перепроверяет статус под блокировкой.
+ * Запуски на разных сайтах одного сервера MySQL не мешают друг другу: имя GET_LOCK — Db::lockName().
  */
 final class OrderExpiryService
 {
     private const OPEN_ORDER_STATUSES = ['draft', 'pending_payment', 'payment_processing', 'payment_failed'];
-    /** Бюджет одного запуска: HTTP-опрос банка не должен пережить таймаут задачи Action Scheduler. */
-    private const TIME_BUDGET_SECONDS = 40;
-    private const LOCK_NAME = 'uniundata_expire_orders';
-    private const EXTENSION_AUDIT_ACTION = 'order.payment_due_extended';
-
-    private \wpdb $wpdb;
+    /**
+     * Бюджет одного запуска. max_execution_time на сервере — 30 с, HTTP-таймаут адаптера ≤ 10 с:
+     * новый заказ берём, только пока до лимита остаётся запас на один опрос банка.
+     */
+    private const TIME_BUDGET_SECONDS = 15;
+    private const LOCK_NAME = 'expire_orders';
 
     public function __construct(
         private readonly Db $db,
         private readonly AuditLog $audit,
         private readonly PaymentProviderInterface $provider,
         private readonly PaymentService $payments,
-        ?\wpdb $wpdb = null,
     ) {
-        $this->wpdb = $wpdb ?? $GLOBALS['wpdb'];
     }
 
     /**
@@ -50,7 +50,8 @@ final class OrderExpiryService
         $limit = max(1, min(500, $limit));
         // Второй параллельный запуск (WP-CLI + AS) не должен дважды опрашивать банк. Корректность
         // обеспечивают guard-ы под блокировками; GET_LOCK — только экономия HTTP-запросов.
-        if ((int) $this->scalar('SELECT GET_LOCK(%s, 0)', self::LOCK_NAME) !== 1) {
+        // Db::getLock() = GET_LOCK(Db::lockName('expire_orders'), 0): имя уникально для БД и префикса.
+        if (!$this->db->getLock(self::LOCK_NAME)) {
             return 0;
         }
         try {
@@ -85,7 +86,7 @@ final class OrderExpiryService
 
             return $closed;
         } finally {
-            $this->scalar('SELECT RELEASE_LOCK(%s)', self::LOCK_NAME);
+            $this->db->releaseLock(self::LOCK_NAME);
         }
     }
 
@@ -141,7 +142,10 @@ final class OrderExpiryService
             fn (): array => $this->expireTx($orderId, $itemIds, $bankProcessing, $bankUnknown, $graceMinutes)
         );
 
-        // 3. После COMMIT: закрыть сессии у банка (best effort).
+        // 3. После COMMIT: уведомить менеджера о продлении и закрыть сессии у банка (best effort).
+        if ($result['extended'] && \function_exists('as_enqueue_async_action')) {
+            as_enqueue_async_action(PaymentService::HOOK_ATTENTION, ['order_id' => $orderId, 'reason' => 'payment_processing_overdue'], PaymentService::AS_GROUP, true);
+        }
         foreach ($result['cancel_sessions'] as $p) {
             $providerPaymentId = $p['provider_payment_id'] ?? ($bankSessionIds[(int) $p['id']] ?? null);
             if ($providerPaymentId === null) {
@@ -159,12 +163,12 @@ final class OrderExpiryService
 
     /**
      * @param list<int> $itemIds
-     * @return array{expired: bool, cancel_sessions: list<array<string, mixed>>}
+     * @return array{expired: bool, extended: bool, cancel_sessions: list<array<string, mixed>>}
      */
     private function expireTx(int $orderId, array $itemIds, bool $bankProcessing, bool $bankUnknown, int $graceMinutes): array
     {
         $t = $this->tables();
-        $noop = ['expired' => false, 'cancel_sessions' => []];
+        $noop = ['expired' => false, 'extended' => false, 'cancel_sessions' => []];
 
         // (2) Экземпляры заказа.
         $items = $itemIds === [] ? [] : $this->rowsById(
@@ -174,7 +178,7 @@ final class OrderExpiryService
         );
         // (5) Заказ + перепроверка срока в БД.
         $order = $this->row(
-            'SELECT id, status, needs_attention,
+            'SELECT id, status, needs_attention, payment_due_extended_at,
                     (payment_due_at <= UTC_TIMESTAMP(6)) AS is_due,
                     (payment_due_at <= UTC_TIMESTAMP(6) - INTERVAL %d MINUTE) AS is_overdue_by_grace
                FROM %i WHERE id = %d FOR UPDATE',
@@ -204,22 +208,25 @@ final class OrderExpiryService
         }
 
         // Банк обрабатывает платёж: однократное продление на grace + флаг для менеджера.
-        if ($bankProcessing && !$this->wasExtended($orderId)) {
+        // Признак однократности — orders.payment_due_extended_at (меняется под блокировкой заказа).
+        if ($bankProcessing && $order['payment_due_extended_at'] === null) {
             $this->expectAffected($this->exec(
                 "UPDATE %i
                     SET payment_due_at = UTC_TIMESTAMP(6) + INTERVAL %d MINUTE,
+                        payment_due_extended_at = UTC_TIMESTAMP(6),
                         attention_reason = IF(needs_attention = 1, attention_reason, 'payment_processing_overdue'),
                         needs_attention = 1
-                  WHERE id = %d AND status IN ('draft', 'pending_payment', 'payment_processing', 'payment_failed')",
+                  WHERE id = %d AND payment_due_extended_at IS NULL
+                    AND status IN ('draft', 'pending_payment', 'payment_processing', 'payment_failed')",
                 $t['orders'],
                 max(1, $graceMinutes),
                 $orderId
             ), 1, 'order payment_due_at extension');
-            $this->audit->record(self::EXTENSION_AUDIT_ACTION, 'order', $orderId, $status, $status, [
+            $this->audit->record('order.payment_due_extended', 'order', $orderId, $status, $status, [
                 'reason' => 'bank_reports_processing', 'grace_minutes' => $graceMinutes,
             ], 'cron');
 
-            return $noop;
+            return ['expired' => false, 'extended' => true, 'cancel_sessions' => []];
         }
 
         // Закрываем заказ.
@@ -233,25 +240,18 @@ final class OrderExpiryService
 
         $cancel = [];
         foreach ($payments as $p) {
-            // По контракту: pending/processing → expired; created → failed (прямого created → expired нет).
-            $to = match ($p['status']) {
-                'pending', 'processing' => 'expired',
-                'created' => 'failed',
-                default => null,
-            };
-            if ($to === null) {
+            // Контракт v2: created|pending|processing → expired.
+            if (!\in_array($p['status'], ['created', 'pending', 'processing'], true)) {
                 continue;
             }
             $this->expectAffected($this->exec(
-                'UPDATE %i SET failure_code = IF(%s = \'failed\', \'order_expired\', failure_code), status = %s
-                  WHERE id = %d AND status = %s',
+                "UPDATE %i SET failure_code = COALESCE(failure_code, 'order_expired'), status = 'expired'
+                  WHERE id = %d AND status = %s",
                 $t['payments'],
-                $to,
-                $to,
                 (int) $p['id'],
                 (string) $p['status']
-            ), 1, 'payment → ' . $to);
-            $this->audit->record('payment.status_changed', 'payment', (int) $p['id'], (string) $p['status'], $to, ['reason' => 'order_expired'], 'cron');
+            ), 1, 'payment → expired');
+            $this->audit->record('payment.status_changed', 'payment', (int) $p['id'], (string) $p['status'], 'expired', ['reason' => 'order_expired'], 'cron');
             $cancel[] = $p; // provider_payment_id может быть null у created — дополняется ответом банка
         }
 
@@ -279,19 +279,7 @@ final class OrderExpiryService
             }
         }
 
-        return ['expired' => true, 'cancel_sessions' => $cancel];
-    }
-
-    /** Продление делается один раз: признак — запись аудита (append-only, в той же транзакции, что и продление). */
-    private function wasExtended(int $orderId): bool
-    {
-        return $this->scalar(
-            'SELECT 1 FROM %i WHERE entity_type = %s AND entity_id = %d AND action = %s LIMIT 1',
-            $this->db->table('book_audit_log'),
-            'order',
-            $orderId,
-            self::EXTENSION_AUDIT_ACTION
-        ) !== null;
+        return ['expired' => true, 'extended' => false, 'cancel_sessions' => $cancel];
     }
 
     /** @return array{0: int, 1: int} [payment_ttl_minutes, payment_grace_minutes] */
@@ -319,66 +307,43 @@ final class OrderExpiryService
     }
 
     /** @return ?array<string, mixed> */
-    private function row(string $sql, mixed ...$args): ?array
+    private function row(string $sql, int|string|float ...$args): ?array
     {
-        $r = $this->wpdb->get_row($this->wpdb->prepare($sql, ...$args), ARRAY_A);
-        $this->assertNoDbError();
-
-        return is_array($r) ? $r : null;
+        return $this->db->getRow($sql, ...$args);
     }
 
     /** @return list<array<string, mixed>> */
-    private function rows(string $sql, mixed ...$args): array
+    private function rows(string $sql, int|string|float ...$args): array
     {
-        $r = $this->wpdb->get_results($this->wpdb->prepare($sql, ...$args), ARRAY_A);
-        $this->assertNoDbError();
-
-        return is_array($r) ? $r : [];
+        return $this->db->getResults($sql, ...$args);
     }
 
     /** @return array<int, array<string, mixed>> */
-    private function rowsById(string $sql, mixed ...$args): array
+    private function rowsById(string $sql, int|string|float ...$args): array
     {
         $out = [];
-        foreach ($this->rows($sql, ...$args) as $r) {
+        foreach ($this->db->getResults($sql, ...$args) as $r) {
             $out[(int) $r['id']] = $r;
         }
 
         return $out;
     }
 
-    /** @return list<string> */
-    private function col(string $sql, mixed ...$args): array
+    /** @return list<string> Первая колонка результата. */
+    private function col(string $sql, int|string|float ...$args): array
     {
-        $r = $this->wpdb->get_col($this->wpdb->prepare($sql, ...$args));
-        $this->assertNoDbError();
-
-        return array_values(array_map('strval', $r));
+        return array_map(static fn (array $r): string => (string) array_values($r)[0], $this->db->getResults($sql, ...$args));
     }
 
-    private function scalar(string $sql, mixed ...$args): ?string
+    private function scalar(string $sql, int|string|float ...$args): ?string
     {
-        $r = $this->wpdb->get_var($this->wpdb->prepare($sql, ...$args));
-        $this->assertNoDbError();
-
-        return $r === null ? null : (string) $r;
+        return $this->db->getVar($sql, ...$args);
     }
 
-    private function exec(string $sql, mixed ...$args): int
+    /** INSERT/UPDATE: число изменённых строк (UPDATE теми же значениями даёт 0). Ошибка MySQL → исключение. */
+    private function exec(string $sql, int|string|float ...$args): int
     {
-        $r = $this->wpdb->query($this->wpdb->prepare($sql, ...$args));
-        if ($r === false) {
-            throw new \RuntimeException('DB error: ' . $this->wpdb->last_error, $this->db->lastErrno());
-        }
-
-        return (int) $r;
-    }
-
-    private function assertNoDbError(): void
-    {
-        if ($this->wpdb->last_error !== '') {
-            throw new \RuntimeException('DB error: ' . $this->wpdb->last_error, $this->db->lastErrno());
-        }
+        return $this->db->execute($sql, ...$args);
     }
 
     private function expectAffected(int $actual, int $expected, string $what): void

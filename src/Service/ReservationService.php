@@ -17,6 +17,10 @@ use Uniundata\Books\Infrastructure\Db;
  * Решения принимаются только по строкам, прочитанным SELECT … FOR UPDATE внутри транзакции.
  * UNIQUE/CHECK схемы — второй рубеж: их нарушения (1062/3819) переводятся в DomainError.
  *
+ * Настройки (wp_options, autoload): uniundata_currency — валюта магазина, ISO 4217 (обязательна:
+ * без неё резерв отвечает 500, чтобы в корзину не попали книги в чужой валюте);
+ * uniundata_max_active_reservations — сколько книг пользователь держит одновременно (по умолчанию 10).
+ *
  * Методы с пометкой @internal — общие шаги для ReservationExpiryService; они рассчитывают на блокировки,
  * уже взятые вызывающим кодом в правильном порядке.
  *
@@ -29,15 +33,29 @@ use Uniundata\Books\Infrastructure\Db;
 final class ReservationService
 {
     public const MAX_ATTEMPTS = 3;
+    public const DEFAULT_MAX_ACTIVE_RESERVATIONS = 10;
 
+    /**
+     * @param int         $reservationMinutes    Резерв — ровно 1 час (option uniundata_reservation_minutes
+     *                                           меняется только вместе с бизнес-правилами).
+     * @param int|null    $maxActiveReservations null — option uniundata_max_active_reservations при каждом резерве.
+     * @param string|null $shopCurrency          null — option uniundata_currency при каждом резерве.
+     */
     public function __construct(
         private readonly Db $db,
         private readonly AuditLog $audit,
-        // Резерв — ровно 1 час (option uniundata_reservation_minutes меняется только вместе с бизнес-правилами).
         private readonly int $reservationMinutes = 60,
+        private readonly ?int $maxActiveReservations = null,
+        private readonly ?string $shopCurrency = null,
     ) {
         if ($reservationMinutes < 1 || $reservationMinutes > 1440) {
             throw new \InvalidArgumentException('Reservation length must be between 1 and 1440 minutes');
+        }
+        if ($maxActiveReservations !== null && $maxActiveReservations < 1) {
+            throw new \InvalidArgumentException('maxActiveReservations must be >= 1');
+        }
+        if ($shopCurrency !== null && preg_match('/^[A-Z]{3}$/', $shopCurrency) !== 1) {
+            throw new \InvalidArgumentException('Shop currency must be an ISO 4217 code');
         }
     }
 
@@ -48,6 +66,11 @@ final class ReservationService
     /**
      * POST /cart/reserve. Вызывающий уже проверил is_user_logged_in, reserve_books, nonce и rate limit.
      *
+     * Ошибки: 404 uniundata_item_not_found; 409 uniundata_item_unavailable (data.availability_status;
+     * data.reason = 'currency', если цена не в валюте магазина); 409 uniundata_reservation_limit_reached
+     * (3 попытки на экземпляр); 409 uniundata_active_reservation_limit (слишком много книг одновременно);
+     * 503 uniundata_conflict_retry.
+     *
      * @return array{created: bool, reservation: array<string, mixed>, cart: array<string, mixed>}
      *         created=false — повторное «Отложить» на свой активный резерв (HTTP 200 вместо 201, попытка не тратится).
      */
@@ -55,8 +78,13 @@ final class ReservationService
     {
         self::assertUserId($userId);
         self::assertItemId($itemId);
+        // Настройки читаются до транзакции: get_option() может сходить в БД, а повтор $fn их не меняет.
+        $shopCurrency = $this->shopCurrency();
+        $maxActive = $this->maxActiveReservations();
 
-        $result = $this->db->transaction(fn (): array => $this->reserveInTransaction($userId, $itemId));
+        $result = $this->db->transaction(
+            fn (): array => $this->reserveInTransaction($userId, $itemId, $shopCurrency, $maxActive),
+        );
         // Корзину читаем уже после COMMIT, без блокировок.
         $result['cart'] = $this->getCart($userId);
 
@@ -239,7 +267,7 @@ final class ReservationService
         foreach ($rows as $row) {
             $isExpired = $row['is_expired'] === '1';
             $price = (int) $row['unit_price_amount'];
-            $currency = strtoupper((string) $row['currency']);
+            $currency = (string) $row['currency'];
             $attemptNo = $row['attempt_no'] !== null ? (int) $row['attempt_no'] : null;
             if (!$isExpired) {
                 $totals[$currency] = ($totals[$currency] ?? 0) + $price;
@@ -259,7 +287,7 @@ final class ReservationService
                 'unit_price_amount' => $price,
                 'currency' => $currency,
                 'price_changed' => (int) $row['current_price_amount'] !== $price
-                    || strtoupper((string) $row['current_currency']) !== $currency,
+                    || (string) $row['current_currency'] !== $currency,
                 'added_at' => Db::toIso8601($row['added_at']),
                 'expires_at' => Db::toIso8601($row['expires_at']),
                 'seconds_left' => (int) $row['seconds_left'],
@@ -275,7 +303,8 @@ final class ReservationService
             'items' => $items,
             'items_count' => \count(array_filter($items, static fn (array $i): bool => !$i['is_expired'])),
             'totals' => $totals,
-            // Корзина в нескольких валютах не суммируется: клиент смотрит totals.
+            // Позиции в разных валютах возможны только после смены uniundata_currency: тогда не суммируем,
+            // клиент смотрит totals.
             'subtotal_amount' => \count($totals) <= 1 ? (int) array_sum($totals) : null,
             'currency' => \count($totals) === 1 ? (string) array_key_first($totals) : null,
             'expires_at' => Db::toIso8601($earliest),
@@ -332,7 +361,7 @@ final class ReservationService
             $reservation['id'],
         );
 
-        // attempt_no = NULL только вместе с released_by_admin (ck_reservations_attempt_admin): слот попытки освобождается.
+        // attempt_no = NULL только вместе с released_by_admin (wp_book_reservations_chk_attempt_admin): слот попытки освобождается.
         $attemptSql = $to === ReservationStatus::ReleasedByAdmin ? ', attempt_no = NULL' : '';
         $changed = $this->db->execute(
             "UPDATE {$this->t('reservations')}
@@ -514,8 +543,7 @@ final class ReservationService
             'is_active' => $row['is_active'] === '1',
             'record_active' => $row['record_active'] === '1',
             'price_amount' => (int) $row['price_amount'],
-            // Колонка ascii_general_ci пропускает 'eur' через CHECK — нормализуем.
-            'currency' => strtoupper((string) $row['currency']),
+            'currency' => (string) $row['currency'], // utf8mb4_bin + CHECK '^[A-Z]{3}$': только верхний регистр
         ];
     }
 
@@ -542,9 +570,10 @@ final class ReservationService
     // =============================================================================================
 
     /** @return array{created: bool, reservation: array<string, mixed>} */
-    private function reserveInTransaction(int $userId, int $itemId): array
+    private function reserveInTransaction(int $userId, int $itemId, string $shopCurrency, int $maxActive): array
     {
-        // (a) Корзина — первый уровень порядка блокировок; сериализует параллельные запросы одного пользователя.
+        // (a) Корзина — первый уровень порядка блокировок; сериализует параллельные запросы одного пользователя:
+        // все резервы пользователя создаются под блокировкой его единственной открытой корзины.
         $cart = $this->lockOrCreateOpenCart($userId);
 
         // (b) Экземпляр: второй пользователь ждёт здесь, пока первый не сделает COMMIT, и затем видит reserved.
@@ -583,6 +612,10 @@ final class ReservationService
         if ($item['availability_status'] !== ItemStatus::Available->value) {
             throw DomainError::itemUnavailable($itemId, $item['availability_status']);
         }
+        // Цена не в валюте магазина — экземпляр не продаётся (sync такие пропускает; это страховка).
+        if ($item['currency'] !== $shopCurrency) {
+            throw DomainError::itemCurrencyNotAccepted($itemId, $item['availability_status'], $item['currency'], $shopCurrency);
+        }
 
         // (e) Лимит попыток. Все резервы экземпляра создаются под его блокировкой, поэтому COUNT стабилен.
         // Индекс: uq_reservations_attempt (user_id, book_item_id, attempt_no) или ix_reservations_user — оба по user_id.
@@ -594,6 +627,18 @@ final class ReservationService
         );
         if ($used >= self::MAX_ATTEMPTS) {
             throw DomainError::reservationLimitReached($itemId, self::MAX_ATTEMPTS);
+        }
+
+        // (e2) Сколько книг пользователь держит сейчас. Стабильно под блокировкой корзины из (a): новые
+        // резервы пользователя появляются только под ней, остальные операции число лишь уменьшают.
+        // Просроченные, но ещё не снятые cron-ом резервы не считаются. Индекс ix_reservations_user.
+        $activeNow = (int) $this->db->getVar(
+            "SELECT COUNT(*) FROM {$this->t('reservations')}
+              WHERE user_id = %d AND reservation_status = 'active' AND expires_at > UTC_TIMESTAMP(6)",
+            $userId,
+        );
+        if ($activeNow >= $maxActive) {
+            throw DomainError::activeReservationLimit($maxActive);
         }
 
         // (f) Резерв. Время берётся у БД после всех ожиданий блокировок; одно выражение — одно значение NOW.
@@ -677,11 +722,17 @@ final class ReservationService
     /**
      * Открытая корзина пользователя FOR UPDATE; если нет — создаётся.
      *
-     * Гонка двух первых запросов одного пользователя решается на uq_carts_one_open_per_user. Вместо
-     * «INSERT → 1062 → повторный SELECT FOR UPDATE» используется ON DUPLICATE KEY UPDATE: после 1062
-     * каждый проигравший держит S-lock на дубликате и просит X — при 3+ параллельных запросах это
-     * deadlock (воспроизведено на 8.0.46). ODKU сразу берёт X-lock на существующую строку, а
-     * LAST_INSERT_ID(id) возвращает её id; rows_affected: 1 — создана, 0 — уже была.
+     * Гонка двух первых запросов одного пользователя решается на uq_carts_one_open_per_user через
+     * INSERT … ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id): проигравший сразу берёт X-lock на строку
+     * победителя, а LAST_INSERT_ID(id) возвращает её id; rows_affected: 1 — создана, 0 — уже была.
+     * Вариант «INSERT → 1062 → повторный SELECT FOR UPDATE» хуже: после 1062 каждый проигравший держит
+     * S-lock на дубликате и просит X — при 3+ параллельных запросах это deadlock (воспроизведено на 8.0.46).
+     *
+     * Deadlock возможен и здесь, но редко: ключ новой корзины совпадает с ключом только что закрытой
+     * (checkout, истечение) корзины, чья запись в uq_carts_one_open_per_user ещё не вычищена purge-ом;
+     * проверка дубликата берёт gap-lock даже в READ COMMITTED, и параллельные checkout + reserve соседних
+     * пользователей могут встретиться на одном промежутке (docs/10). Инварианты это не нарушает:
+     * InnoDB откатывает одну транзакцию, Db::transaction() её повторяет.
      *
      * @return CartRow
      */
@@ -745,7 +796,7 @@ final class ReservationService
             return DomainError::itemUnavailable($itemId, ItemStatus::Reserved->value, $e);
         }
         if ($this->db->isDuplicateKey('uq_reservations_attempt', $e)
-            || $this->db->isCheckViolation('ck_reservations_attempt_range', $e)) {
+            || $this->db->isCheckViolation('_chk_attempt_range', $e)) {
             return DomainError::reservationLimitReached($itemId, self::MAX_ATTEMPTS, $e);
         }
 
@@ -767,6 +818,28 @@ final class ReservationService
             'reserved_at' => Db::toIso8601($r['reserved_at']),
             'expires_at' => Db::toIso8601($r['expires_at']),
         ];
+    }
+
+    /** Валюта магазина (ISO 4217). Без корректной настройки резервировать нельзя — fail closed. */
+    private function shopCurrency(): string
+    {
+        $currency = $this->shopCurrency ?? strtoupper(trim((string) get_option('uniundata_currency', '')));
+        if (preg_match('/^[A-Z]{3}$/', $currency) !== 1) {
+            throw new \LogicException('Option uniundata_currency must be set to an ISO 4217 code (e.g. RUB)');
+        }
+
+        return $currency;
+    }
+
+    private function maxActiveReservations(): int
+    {
+        if ($this->maxActiveReservations !== null) {
+            return $this->maxActiveReservations;
+        }
+        $value = (int) get_option('uniundata_max_active_reservations', self::DEFAULT_MAX_ACTIVE_RESERVATIONS);
+
+        // 0, отрицательное или мусор в опции — не «запретить всё», а значение по умолчанию.
+        return $value >= 1 ? $value : self::DEFAULT_MAX_ACTIVE_RESERVATIONS;
     }
 
     private function t(string $table): string

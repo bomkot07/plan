@@ -28,7 +28,7 @@ enum ReservationStatus: string
 
     /**
      * Попытка для лимита «3 резерва на экземпляр» — любой резерв, кроме снятого администратором.
-     * В БД: attempt_no IS NULL ⇔ released_by_admin (ck_reservations_attempt_admin).
+     * В БД: attempt_no IS NULL ⇔ released_by_admin (wp_book_reservations_chk_attempt_admin).
      */
     public function countsAsAttempt(): bool
     {

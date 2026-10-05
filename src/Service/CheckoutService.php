@@ -7,6 +7,7 @@ namespace Uniundata\Books\Service;
 use Uniundata\Books\Domain\DomainError;
 use Uniundata\Books\Infrastructure\AuditLog;
 use Uniundata\Books\Infrastructure\Db;
+use Uniundata\Books\Payment\FiscalReceipt;
 use Uniundata\Books\Payment\PaymentProviderInterface;
 use Uniundata\Books\Payment\PaymentSession;
 
@@ -14,34 +15,33 @@ use Uniundata\Books\Payment\PaymentSession;
  * Оформление заказа и платёжные попытки покупателя.
  *
  * checkout() = Tx1 (заказ draft + платёж created, резервы → converted_to_order, экземпляры →
- * checkout_pending) → createSession у банка ВНЕ транзакции → Tx2 (платёж pending, заказ
- * pending_payment; при ошибке банка — payment failed / order payment_failed).
+ * checkout_pending) → createSession у банка ВНЕ транзакции → Tx2 (платёж pending + session_redirect_url,
+ * заказ pending_payment; при ошибке банка — payment failed / order payment_failed).
+ * Повтор /checkout с тем же Idempotency-Key и /orders/{id}/pay при живой сессии возвращают сохранённый
+ * session_redirect_url без нового createSession.
  *
- * Порядок блокировок (контракт): carts → items (asc) → reservations → cart_items → orders → payments.
- * Все решения — по строкам, прочитанным SELECT … FOR UPDATE; переходы — условными UPDATE с проверкой
- * числа затронутых строк. Время — только UTC_TIMESTAMP(6) в SQL.
+ * Порядок блокировок (docs/08): carts → items (asc) → reservations → cart_items → orders → payments.
+ * INSERT order_items берёт неявный S-lock на book_records (проверка FK) уже после items — безопасно:
+ * синхронизация не держит X на записи, ожидая экземпляры. Решения — по строкам, прочитанным
+ * SELECT … FOR UPDATE; переходы — условными UPDATE с проверкой числа строк. Время — UTC_TIMESTAMP(6).
  */
 final class CheckoutService
 {
-    /** Открытые заказы: экземпляры удерживаются в checkout_pending. */
-    private const OPEN_ORDER_STATUSES = ['draft', 'pending_payment', 'payment_processing', 'payment_failed'];
     /** Где покупатель может начать/повторить оплату или отменить заказ. */
     private const PAYABLE_ORDER_STATUSES = ['draft', 'pending_payment', 'payment_failed'];
+    /** Платёж, после которого новая попытка и отмена невозможны: деньги в пути или получены. */
+    private const MONEY_IN_FLIGHT = ['processing', 'succeeded', 'refunded', 'partially_refunded'];
     /** Короче этого сессию у банка не открываем: покупатель не успеет оплатить. */
     private const MIN_SESSION_SECONDS = 120;
-    /** Пока сессия жива дольше этого запаса — повторный /pay переиспользует её (тот же idempotency_key). */
+    /** Пока сессия жива дольше этого запаса — повтор возвращает её URL (вторую сессию не открываем). */
     private const SESSION_REUSE_MARGIN_SECONDS = 60;
     private const MAX_PAYMENT_ATTEMPTS = 10;
-
-    private \wpdb $wpdb;
 
     public function __construct(
         private readonly Db $db,
         private readonly AuditLog $audit,
         private readonly PaymentProviderInterface $provider,
-        ?\wpdb $wpdb = null,
     ) {
-        $this->wpdb = $wpdb ?? $GLOBALS['wpdb'];
     }
 
     // =================================================================================================
@@ -51,13 +51,14 @@ final class CheckoutService
     /**
      * @return array{created: bool, replayed: bool, order: array<string, mixed>, payment: ?array<string, mixed>}
      *
-     * @throws DomainError uniundata_cart_empty | uniundata_cart_changed | uniundata_invalid_param |
-     *                     uniundata_payment_provider_error (заказ при этом уже создан, data.public_order_id)
+     * @throws DomainError uniundata_cart_empty | uniundata_cart_changed | uniundata_terms_outdated |
+     *                     uniundata_invalid_param | uniundata_payment_provider_error (заказ уже создан,
+     *                     data.public_order_id)
      */
     public function checkout(int $userId, CheckoutRequest $req): array
     {
         if ($userId <= 0) {
-            throw new DomainError('uniundata_auth_required', \__('Please log in to continue.', 'uniundata-books'), 401);
+            throw DomainError::authRequired();
         }
 
         // Быстрый путь идемпотентности: повтор того же Idempotency-Key → тот же заказ.
@@ -67,18 +68,19 @@ final class CheckoutService
         }
 
         // Снимки и настройки — вне транзакции (функции WP, кэш, без блокировок).
-        $customer = $this->customerSnapshot($userId, $req);
         $terms = $this->termsSnapshot($req);
+        $customer = $this->customerSnapshot($userId, $req);
+        $currency = $this->shopCurrency();
         [$ttlMinutes, $graceMinutes] = $this->paymentWindow();
 
         try {
             $tx = $this->db->transaction(
-                fn (): array => $this->createOrderTx($userId, $req, $customer, $terms, $ttlMinutes + $graceMinutes)
+                fn (): array => $this->createOrderTx($userId, $req, $customer, $terms, $currency, $ttlMinutes + $graceMinutes)
             );
         } catch (\RuntimeException $e) {
             // Второй рубеж: 1062 по uq_orders_checkout_request (параллельный запрос с тем же ключом).
-            $dup = $this->findOrderByCheckoutKey($userId, $req->idempotencyKey);
-            if ($dup !== null && !$e instanceof DomainError) {
+            $dup = $e instanceof DomainError ? null : $this->findOrderByCheckoutKey($userId, $req->idempotencyKey);
+            if ($dup !== null) {
                 return $this->replay($userId, $dup, $req);
             }
             throw $e;
@@ -89,12 +91,7 @@ final class CheckoutService
         }
         if ($tx['kind'] === 'cart_changed') {
             // Истёкшие позиции уже помечены и ЗАКОММИЧЕНЫ: клиент показывает новую корзину и подтверждает.
-            throw new DomainError(
-                'uniundata_cart_changed',
-                \__('Your cart has changed. Please review it and confirm again.', 'uniundata-books'),
-                409,
-                $tx['data']
-            );
+            throw DomainError::cartChanged($tx['data']);
         }
 
         $payment = $this->openSession($tx['order_id'], $tx['payment_id'], $userId);
@@ -108,14 +105,14 @@ final class CheckoutService
     }
 
     /**
-     * Tx1. Возвращает kind=created|cart_changed|replay. При cart_changed изменения (истёкшие позиции)
-     * фиксируются COMMIT-ом, исключение бросает вызывающий код уже после транзакции.
+     * Tx1. Возвращает kind=created|cart_changed|replay. При cart_changed изменения (истёкшие позиции,
+     * корзина → checkout_started) фиксируются COMMIT-ом, исключение бросает вызывающий код.
      *
-     * @param array<string, ?string>               $customer
-     * @param array<string, array<string, string>> $terms
+     * @param array{email: string, first_name: string, last_name: string, middle_name: ?string, phone: ?string} $customer
+     * @param array<string, array{version: string, sha256: string}> $terms
      * @return array<string, mixed>
      */
-    private function createOrderTx(int $userId, CheckoutRequest $req, array $customer, array $terms, int $dueMinutes): array
+    private function createOrderTx(int $userId, CheckoutRequest $req, array $customer, array $terms, string $shopCurrency, int $dueMinutes): array
     {
         $t = $this->tables();
 
@@ -132,7 +129,7 @@ final class CheckoutService
             return ['kind' => 'replay', 'order' => $dup];
         }
         if ($cart === null) {
-            throw new DomainError('uniundata_cart_empty', \__('Your cart is empty.', 'uniundata-books'), 409);
+            throw DomainError::cartEmpty();
         }
         $cartId = (int) $cart['id'];
 
@@ -143,7 +140,7 @@ final class CheckoutService
             $cartId
         );
         if ($positions === []) {
-            throw new DomainError('uniundata_cart_empty', \__('Your cart is empty.', 'uniundata-books'), 409);
+            throw DomainError::cartEmpty();
         }
         $itemIds = $this->ids(array_column($positions, 'book_item_id'));
         $reservationIds = $this->ids(array_column($positions, 'reservation_id'));
@@ -164,7 +161,7 @@ final class CheckoutService
         );
         // (4) Позиции корзины.
         $cartItems = $this->rowsById(
-            'SELECT id, book_item_id, reservation_id, unit_price_amount, currency, status, expires_at
+            'SELECT id, book_item_id, reservation_id, unit_price_amount, currency, status
                FROM %i WHERE id IN (' . $this->in($cartItemIds) . ') ORDER BY id FOR UPDATE',
             $t['cart_items'],
             ...$cartItemIds
@@ -184,6 +181,7 @@ final class CheckoutService
                 (int) $r['alive'] !== 1 => 'expired',
                 $i['availability_status'] !== 'reserved' => 'item_not_reserved',
                 (int) $i['is_active'] !== 1 => 'item_inactive',
+                $ci['currency'] !== $shopCurrency => 'currency', // валюту магазина сменили после резерва
                 default => 'ok',
             };
             if ($reason === 'ok') {
@@ -194,8 +192,8 @@ final class CheckoutService
         }
 
         if ($invalid !== []) {
-            $this->expirePositions($cartId, $userId, $invalid);
-            $this->refreshCart($cartId);
+            $this->expirePositions($userId, $invalid);
+            $this->refreshCart($cartId, (string) $cart['status'], $userId);
 
             return ['kind' => 'cart_changed', 'data' => [
                 'reason' => 'positions_expired',
@@ -204,17 +202,18 @@ final class CheckoutService
             ]];
         }
         if ($valid === []) {
-            throw new DomainError('uniundata_cart_empty', \__('Your cart is empty.', 'uniundata-books'), 409);
+            throw DomainError::cartEmpty();
         }
 
         // Сумма — по снимкам цен в корзине (цена, которую покупатель видел при резерве).
-        $currencies = array_values(array_unique(array_column($valid, 'currency')));
         $total = array_sum(array_map(static fn (array $ci): int => (int) $ci['unit_price_amount'], $valid));
-        if (count($currencies) !== 1 || $currencies[0] !== $req->currency || $total !== $req->expectedTotalAmount) {
+        if ($shopCurrency !== $req->currency || $total !== $req->expectedTotalAmount) {
+            $this->refreshCart($cartId, (string) $cart['status'], $userId);
+
             return ['kind' => 'cart_changed', 'data' => [
                 'reason' => 'total_mismatch',
                 'actual_total_amount' => $total,
-                'currency' => count($currencies) === 1 ? $currencies[0] : null,
+                'currency' => $shopCurrency,
                 'cart' => $this->cartSnapshot($cartId),
             ]];
         }
@@ -222,7 +221,7 @@ final class CheckoutService
         $validCartItemIds = $this->ids(array_column($valid, 'id'));
         $validItemIds = $this->ids(array_column($valid, 'book_item_id'));
         $validReservationIds = $this->ids(array_column($valid, 'reservation_id'));
-        $n = count($valid);
+        $n = \count($valid);
 
         // Согласия (append-only доказательство): оферта привязывается к заказу, политика — отдельной строкой.
         $offerConsentId = $this->insertConsent($userId, 'offer', $terms['offer'], $req);
@@ -245,7 +244,7 @@ final class CheckoutService
             $userId,
             $cartId,
             $req->idempotencyKey,
-            $req->currency,
+            $shopCurrency,
             $total,
             $total,
             $customer['email'],
@@ -258,10 +257,10 @@ final class CheckoutService
             $offerConsentId,
             $dueMinutes
         );
-        $orderId = (int) $this->wpdb->insert_id;
+        $orderId = $this->db->lastInsertId();
 
         // Снимки позиций: название, автор, ISBN, состояние, цена — не зависят от будущей синхронизации.
-        $inserted = $this->exec(
+        $this->expectAffected($this->exec(
             "INSERT INTO %i
                (order_id, book_item_id, book_record_id, reservation_id, title_snapshot, subtitle_snapshot,
                 author_snapshot, isbn_snapshot, publisher_snapshot, publication_year_snapshot, condition_snapshot,
@@ -282,10 +281,9 @@ final class CheckoutService
             $t['items'],
             $t['records'],
             ...$validCartItemIds
-        );
-        $this->expectAffected($inserted, $n, 'order_items insert');
+        ), $n, 'order_items insert');
 
-        // (3) Резервы → converted_to_order (CHECK ck_reservations_order требует order_id).
+        // (3) Резервы → converted_to_order (CHECK _chk_order требует order_id, _chk_released — released_at).
         $this->expectAffected($this->exec(
             "UPDATE %i
                 SET order_id = %d, released_at = UTC_TIMESTAMP(6), release_reason = 'converted_to_order',
@@ -332,13 +330,13 @@ final class CheckoutService
             $this->provider->name(),
             wp_generate_uuid4(),
             $total,
-            $req->currency
+            $shopCurrency
         );
-        $paymentId = (int) $this->wpdb->insert_id;
+        $paymentId = $this->db->lastInsertId();
 
         // Аудит в той же транзакции: откат — значит, и записи аудита нет.
         $this->audit->record('order.created', 'order', $orderId, null, 'draft', [
-            'public_order_id' => $publicOrderId, 'total_amount' => $total, 'currency' => $req->currency, 'items' => $validItemIds,
+            'public_order_id' => $publicOrderId, 'total_amount' => $total, 'currency' => $shopCurrency, 'items' => $validItemIds,
         ], 'user', $userId);
         $this->audit->record('cart.status_changed', 'cart', $cartId, (string) $cart['status'], 'converted_to_order', ['order_id' => $orderId], 'user', $userId);
         foreach ($valid as $ci) {
@@ -356,7 +354,7 @@ final class CheckoutService
      *
      * @param list<array{ci: array<string, mixed>, reservation: ?array<string, mixed>, item: ?array<string, mixed>, reason: string}> $invalid
      */
-    private function expirePositions(int $cartId, int $userId, array $invalid): void
+    private function expirePositions(int $userId, array $invalid): void
     {
         $t = $this->tables();
         foreach ($invalid as $x) {
@@ -364,6 +362,7 @@ final class CheckoutService
             $r = $x['reservation'];
             $i = $x['item'];
             $itemId = (int) $ci['book_item_id'];
+            $reason = 'checkout_' . $x['reason'];
 
             $ownsItem = $r !== null && $r['reservation_status'] === 'active'
                 && (int) $r['user_id'] === $userId && (int) $r['book_item_id'] === $itemId;
@@ -372,10 +371,10 @@ final class CheckoutService
                     "UPDATE %i SET released_at = UTC_TIMESTAMP(6), release_reason = %s, reservation_status = 'expired'
                       WHERE id = %d AND reservation_status = 'active'",
                     $t['reservations'],
-                    'checkout_' . $x['reason'],
+                    $reason,
                     (int) $r['id']
                 ), 1, 'reservation → expired');
-                $this->audit->record('reservation.status_changed', 'reservation', (int) $r['id'], 'active', 'expired', ['reason' => 'checkout_' . $x['reason']], 'user', $userId);
+                $this->audit->record('reservation.status_changed', 'reservation', (int) $r['id'], 'active', 'expired', ['reason' => $reason], 'user', $userId);
 
                 if ($i !== null && $i['availability_status'] === 'reserved') {
                     $this->expectAffected($this->exec(
@@ -389,7 +388,7 @@ final class CheckoutService
                         $t['items'],
                         $itemId
                     ), 1, 'item → release target');
-                    $this->audit->record('item.status_changed', 'item', $itemId, 'reserved', $this->releaseTarget((string) $i['source_status']), ['reason' => 'checkout_' . $x['reason']], 'user', $userId);
+                    $this->audit->record('item.status_changed', 'item', $itemId, 'reserved', $this->releaseTarget((string) $i['source_status']), ['reason' => $reason], 'user', $userId);
                 }
             }
 
@@ -402,8 +401,11 @@ final class CheckoutService
         }
     }
 
-    /** Корзина без активных позиций → expired; иначе пересчёт expires_at (только для отображения). */
-    private function refreshCart(int $cartId): void
+    /**
+     * После 409 cart_changed: корзина без активных позиций → expired; иначе → checkout_started
+     * (оформление начато, ждём подтверждения) и пересчёт expires_at (только для отображения).
+     */
+    private function refreshCart(int $cartId, string $fromStatus, int $userId): void
     {
         $t = $this->tables();
         $active = (int) $this->scalar(
@@ -412,26 +414,33 @@ final class CheckoutService
             $cartId
         );
         if ($active === 0) {
-            $this->exec(
+            $closed = $this->exec(
                 "UPDATE %i SET expires_at = NULL, closed_at = UTC_TIMESTAMP(6), status = 'expired'
                   WHERE id = %d AND status IN ('active', 'checkout_started')",
                 $t['carts'],
                 $cartId
             );
+            if ($closed === 1) {
+                $this->audit->record('cart.status_changed', 'cart', $cartId, $fromStatus, 'expired', ['reason' => 'checkout_positions_expired'], 'user', $userId);
+            }
 
             return;
         }
         $this->exec(
             "UPDATE %i
-                SET last_activity_at = UTC_TIMESTAMP(6),
+                SET status = 'checkout_started',
                     checkout_started_at = COALESCE(checkout_started_at, UTC_TIMESTAMP(6)),
+                    last_activity_at = UTC_TIMESTAMP(6),
                     expires_at = (SELECT MIN(ci.expires_at) FROM %i ci WHERE ci.cart_id = %d AND ci.status = 'active')
-              WHERE id = %d",
+              WHERE id = %d AND status IN ('active', 'checkout_started')",
             $t['carts'],
             $t['cart_items'],
             $cartId,
             $cartId
         );
+        if ($fromStatus !== 'checkout_started') {
+            $this->audit->record('cart.status_changed', 'cart', $cartId, $fromStatus, 'checkout_started', [], 'user', $userId);
+        }
     }
 
     /** @return array<string, mixed> Корзина для тела 409 uniundata_cart_changed. */
@@ -450,12 +459,12 @@ final class CheckoutService
             $t['records'],
             $cartId
         );
-        $items = array_map(fn (array $x): array => [
+        $items = array_map(static fn (array $x): array => [
             'book_item_id' => (int) $x['book_item_id'],
             'title' => (string) $x['title'],
             'unit_price_amount' => (int) $x['unit_price_amount'],
             'currency' => (string) $x['currency'],
-            'expires_at' => $this->iso($x['expires_at']),
+            'expires_at' => Db::toIso8601($x['expires_at']),
         ], $rows);
 
         return [
@@ -466,7 +475,7 @@ final class CheckoutService
     }
 
     /**
-     * @param array<string, string> $doc ['version' => …, 'sha256' => …]
+     * @param array{version: string, sha256: string} $doc
      */
     private function insertConsent(int $userId, string $type, array $doc, CheckoutRequest $req): int
     {
@@ -484,12 +493,12 @@ final class CheckoutService
             $req->userAgent !== null ? hash('sha256', $req->userAgent) : ''
         );
 
-        return (int) $this->wpdb->insert_id;
+        return $this->db->lastInsertId();
     }
 
     /**
-     * Повтор того же Idempotency-Key: тот же заказ. Если оплата ещё возможна — та же платёжная
-     * попытка (createSession с тем же ключом у банка вернёт ту же сессию), новая попытка НЕ создаётся.
+     * Повтор того же Idempotency-Key: тот же заказ. Живая сессия — сохранённый redirect URL; платёж без
+     * сессии (`created`) — createSession с тем же ключом. Новая попытка при повторе НЕ создаётся.
      *
      * @param array<string, mixed> $order
      * @return array{created: bool, replayed: bool, order: array<string, mixed>, payment: ?array<string, mixed>}
@@ -497,20 +506,14 @@ final class CheckoutService
     private function replay(int $userId, array $order, CheckoutRequest $req): array
     {
         if ((int) $order['total_amount'] !== $req->expectedTotalAmount || $order['currency'] !== $req->currency) {
-            throw new DomainError(
-                'uniundata_invalid_param',
-                \__('Idempotency-Key was already used for a different checkout.', 'uniundata-books'),
-                400,
-                ['param' => 'Idempotency-Key']
-            );
+            throw DomainError::invalidParam('Idempotency-Key', \__('Idempotency-Key was already used for a different checkout.', 'uniundata-books'));
         }
         $orderId = (int) $order['id'];
         $payment = null;
         try {
             $prep = $this->db->transaction(fn (): array => $this->preparePaymentTx($userId, $orderId, false));
-            if ($prep['payment_id'] !== null) {
-                $payment = $this->openSession($orderId, $prep['payment_id'], $userId);
-            }
+            $payment = $prep['live_session']
+                ?? ($prep['payment_id'] !== null ? $this->openSession($orderId, $prep['payment_id'], $userId) : null);
         } catch (DomainError $e) {
             if ($e->errorCode() !== 'uniundata_order_not_payable') {
                 throw $e;
@@ -525,8 +528,8 @@ final class CheckoutService
     // =================================================================================================
 
     /**
-     * Платёжная попытка по заказу до payment_due_at. Живая сессия (created/pending) переиспользуется
-     * с тем же idempotency_key; после неудачи создаётся новая строка платежа (attempt_no + 1).
+     * Платёжная попытка по заказу до payment_due_at. Живая сессия возвращается из session_redirect_url;
+     * платёж `created` досоздаётся с тем же idempotency_key; после неудачи — новая строка (attempt_no + 1).
      *
      * @return array{created: bool, replayed: bool, order: array<string, mixed>, payment: ?array<string, mixed>}
      */
@@ -536,15 +539,18 @@ final class CheckoutService
         $prep = $this->db->transaction(fn (): array => $this->preparePaymentTx($userId, $orderId, true));
         $this->cancelSessionsBestEffort($prep['cancel_sessions']);
 
-        $payment = $this->openSession($orderId, (int) $prep['payment_id'], $userId);
+        $payment = $prep['live_session'] ?? $this->openSession($orderId, (int) $prep['payment_id'], $userId);
 
         return ['created' => false, 'replayed' => false, 'order' => $this->orderView($orderId), 'payment' => $payment];
     }
 
     /**
-     * Tx: items (asc) → order → payments. Возвращает платёж, для которого нужно открыть/восстановить сессию.
+     * Tx: items (asc) → order → payments.
+     *  - live_session: у последней попытки живая сессия с сохранённым URL — банк не вызываем;
+     *  - payment_id: для этого платежа нужен createSession (новая попытка или тот же ключ);
+     *  - cancel_sessions: заменённые сессии, которые закрываются у банка после COMMIT.
      *
-     * @return array{payment_id: ?int, cancel_sessions: list<array<string, mixed>>}
+     * @return array{payment_id: ?int, live_session: ?array<string, mixed>, cancel_sessions: list<array<string, mixed>>}
      */
     private function preparePaymentTx(int $userId, int $orderId, bool $allowNewAttempt): array
     {
@@ -559,35 +565,30 @@ final class CheckoutService
         );
         // (5) Заказ + запас времени до payment_due_at − grace (сессия банка не должна его пережить).
         $order = $this->row(
-            'SELECT id, user_id, status, total_amount, currency,
+            'SELECT id, user_id, public_order_id, status, total_amount, currency,
                     TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), payment_due_at) AS seconds_to_due
                FROM %i WHERE id = %d FOR UPDATE',
             $t['orders'],
             $orderId
         );
         if ($order === null || (int) $order['user_id'] !== $userId) {
-            throw new DomainError('uniundata_order_not_found', \__('Order not found.', 'uniundata-books'), 404);
+            throw DomainError::orderNotFound();
         }
         $status = (string) $order['status'];
-        if (!in_array($status, self::PAYABLE_ORDER_STATUSES, true)) {
-            throw $this->notPayable($status);
-        }
-        [, $graceMinutes] = $this->paymentWindow();
-        $sessionSeconds = (int) $order['seconds_to_due'] - $graceMinutes * 60;
-        if ($sessionSeconds < self::MIN_SESSION_SECONDS) {
-            throw $this->notPayable($status);
+        if (!\in_array($status, self::PAYABLE_ORDER_STATUSES, true)) {
+            throw DomainError::orderNotPayable($status);
         }
         foreach ($itemIds as $id) {
             if (($items[$id]['availability_status'] ?? null) !== 'checkout_pending') {
                 // Нарушение инварианта «открытый заказ ⇒ экземпляры checkout_pending»: не берём деньги.
-                error_log(sprintf('[uniundata] order #%d is open but item #%d is not checkout_pending', $orderId, $id));
-                throw $this->notPayable($status);
+                error_log(\sprintf('[uniundata] order #%d is open but item #%d is not checkout_pending', $orderId, $id));
+                throw DomainError::orderNotPayable($status);
             }
         }
 
         // (6) Платежи заказа.
         $payments = $this->rows(
-            'SELECT id, attempt_no, status, provider_payment_id, idempotency_key,
+            'SELECT id, attempt_no, status, provider_payment_id, idempotency_key, session_redirect_url, session_expires_at,
                     (session_expires_at > UTC_TIMESTAMP(6) + INTERVAL %d SECOND) AS session_alive
                FROM %i WHERE order_id = %d ORDER BY attempt_no FOR UPDATE',
             self::SESSION_REUSE_MARGIN_SECONDS,
@@ -595,41 +596,55 @@ final class CheckoutService
             $orderId
         );
         foreach ($payments as $p) {
-            if (in_array($p['status'], ['processing', 'succeeded', 'refunded', 'partially_refunded'], true)) {
-                throw $this->notPayable($status); // деньги в пути или уже получены
+            if (\in_array($p['status'], self::MONEY_IN_FLIGHT, true)) {
+                throw DomainError::orderNotPayable($status); // деньги в пути или уже получены
             }
         }
-        $last = $payments === [] ? null : $payments[count($payments) - 1];
+        $last = $payments === [] ? null : $payments[\count($payments) - 1];
+        $lastAlive = $last !== null && $last['status'] === 'pending' && (int) $last['session_alive'] === 1;
 
-        // Сессия не была создана (процесс упал между Tx1 и банком) — тот же ключ, банк вернёт ту же сессию.
-        if ($last !== null && $last['status'] === 'created') {
-            return ['payment_id' => (int) $last['id'], 'cancel_sessions' => []];
+        // Живая сессия с сохранённым URL: вторую не открываем (защита от двойной оплаты), банк не зовём.
+        if ($lastAlive && $last['session_redirect_url'] !== null) {
+            return ['payment_id' => (int) $last['id'], 'cancel_sessions' => [], 'live_session' => [
+                'public_order_id' => (string) $order['public_order_id'],
+                'attempt_no' => (int) $last['attempt_no'],
+                'redirect_url' => (string) $last['session_redirect_url'],
+                'session_expires_at' => Db::toIso8601($last['session_expires_at']),
+                'reused' => true,
+            ]];
         }
-        // Живая сессия — восстанавливаем redirect URL, вторую сессию не открываем (защита от двойной оплаты).
-        if ($last !== null && $last['status'] === 'pending' && (int) $last['session_alive'] === 1) {
-            return ['payment_id' => (int) $last['id'], 'cancel_sessions' => []];
+
+        [, $graceMinutes] = $this->paymentWindow();
+        if ((int) $order['seconds_to_due'] - $graceMinutes * 60 < self::MIN_SESSION_SECONDS) {
+            throw DomainError::orderNotPayable($status);
+        }
+        // Сессия не создана (процесс упал между Tx1 и банком) или URL не сохранён — тот же ключ, банк
+        // вернёт ту же сессию.
+        if ($last !== null && ($last['status'] === 'created' || $lastAlive)) {
+            return ['payment_id' => (int) $last['id'], 'live_session' => null, 'cancel_sessions' => []];
         }
         if (!$allowNewAttempt) {
-            return ['payment_id' => null, 'cancel_sessions' => []];
+            return ['payment_id' => null, 'live_session' => null, 'cancel_sessions' => []];
         }
         $attemptNo = $last === null ? 1 : (int) $last['attempt_no'] + 1;
         if ($attemptNo > self::MAX_PAYMENT_ATTEMPTS) {
-            throw $this->notPayable($status);
+            throw DomainError::orderNotPayable($status);
         }
 
         // Истекающие pending-сессии закрываем у себя; у банка — cancelSession после COMMIT.
         $cancel = [];
         foreach ($payments as $p) {
-            if ($p['status'] === 'pending') {
-                $this->expectAffected($this->exec(
-                    "UPDATE %i SET status = 'expired' WHERE id = %d AND status = 'pending'",
-                    $t['payments'],
-                    (int) $p['id']
-                ), 1, 'payment pending → expired');
-                $this->audit->record('payment.status_changed', 'payment', (int) $p['id'], 'pending', 'expired', ['reason' => 'superseded_by_new_attempt'], 'user', $userId);
-                if ($p['provider_payment_id'] !== null) {
-                    $cancel[] = $p;
-                }
+            if ($p['status'] !== 'pending') {
+                continue;
+            }
+            $this->expectAffected($this->exec(
+                "UPDATE %i SET status = 'expired' WHERE id = %d AND status = 'pending'",
+                $t['payments'],
+                (int) $p['id']
+            ), 1, 'payment pending → expired');
+            $this->audit->record('payment.status_changed', 'payment', (int) $p['id'], 'pending', 'expired', ['reason' => 'superseded_by_new_attempt'], 'user', $userId);
+            if ($p['provider_payment_id'] !== null) {
+                $cancel[] = $p;
             }
         }
 
@@ -644,25 +659,24 @@ final class CheckoutService
             (int) $order['total_amount'],
             (string) $order['currency']
         );
-        $paymentId = (int) $this->wpdb->insert_id;
+        $paymentId = $this->db->lastInsertId();
         $this->audit->record('payment.created', 'payment', $paymentId, null, 'created', ['order_id' => $orderId, 'attempt_no' => $attemptNo], 'user', $userId);
 
-        return ['payment_id' => $paymentId, 'cancel_sessions' => $cancel];
+        return ['payment_id' => $paymentId, 'live_session' => null, 'cancel_sessions' => $cancel];
     }
 
     /**
      * createSession у банка ВНЕ транзакции, затем Tx2. Повторный вызов для того же платежа безопасен:
      * банк идемпотентен по idempotency_key, а Tx2 меняет статусы только из created.
      *
-     * @return array{public_order_id: string, attempt_no: int, redirect_url: string, session_expires_at: ?string}
+     * @return array{public_order_id: string, attempt_no: int, redirect_url: string, session_expires_at: ?string, reused: bool}
      */
     private function openSession(int $orderId, int $paymentId, int $userId): array
     {
         $t = $this->tables();
         [, $graceMinutes] = $this->paymentWindow();
         $p = $this->row(
-            'SELECT p.id, p.attempt_no, p.status, p.idempotency_key, p.amount, p.currency,
-                    o.public_order_id, o.customer_email,
+            'SELECT p.id, p.attempt_no, p.idempotency_key, p.amount, p.currency, o.public_order_id,
                     TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), o.payment_due_at) AS seconds_to_due
                FROM %i p JOIN %i o ON o.id = p.order_id
               WHERE p.id = %d AND p.order_id = %d',
@@ -676,6 +690,8 @@ final class CheckoutService
         }
         $ttl = max(self::MIN_SESSION_SECONDS, (int) $p['seconds_to_due'] - $graceMinutes * 60);
         $publicOrderId = (string) $p['public_order_id'];
+        // 54-ФЗ: позиции и контакт для чека; итог сверяется с суммой платежа до вызова банка.
+        $receipt = $this->receiptForOrder($orderId, (int) $p['amount']);
 
         try {
             $session = $this->provider->createSession(
@@ -686,11 +702,11 @@ final class CheckoutService
                 $ttl,
                 rest_url('uniundata/v1/payment/webhook'),
                 (string) apply_filters('uniundata_payment_return_url', home_url('/checkout/return/?order=' . rawurlencode($publicOrderId)), $publicOrderId),
-                null // e-mail банку не передаём без требования 3-D Secure (минимизация PII)
+                $receipt
             );
         } catch (\Throwable $e) {
             // В лог — только класс исключения: сообщение адаптера может содержать ответ банка.
-            error_log(sprintf('[uniundata] createSession failed for payment #%d: %s', $paymentId, $e::class));
+            error_log(\sprintf('[uniundata] createSession failed for payment #%d: %s', $paymentId, $e::class));
             $orderStatus = $this->db->transaction(fn (): string => $this->markSessionFailedTx($orderId, $paymentId, $userId));
             throw new DomainError(
                 'uniundata_payment_provider_error',
@@ -700,53 +716,76 @@ final class CheckoutService
             );
         }
 
-        $this->db->transaction(fn (): bool => $this->markSessionOpenedTx($orderId, $paymentId, $session, $userId));
+        $closedStatus = $this->db->transaction(fn (): ?string => $this->markSessionOpenedTx($orderId, $paymentId, $session, $userId));
+        if ($closedStatus !== null) {
+            // Пока банк создавал сессию, заказ отменили/закрыли: сессию сразу закрываем у банка.
+            $this->cancelSessionsBestEffort([[
+                'id' => $paymentId, 'provider_payment_id' => $session->providerPaymentId, 'idempotency_key' => $p['idempotency_key'],
+            ]]);
+            throw DomainError::orderNotPayable($closedStatus);
+        }
 
         return [
             'public_order_id' => $publicOrderId,
             'attempt_no' => (int) $p['attempt_no'],
             'redirect_url' => $session->redirectUrl,
-            'session_expires_at' => $this->iso($session->expiresAtSql()),
+            'session_expires_at' => Db::toIso8601($session->expiresAtSql()),
+            'reused' => false,
         ];
     }
 
-    /** Tx2 (успех): orders → payments. created → pending; draft/payment_failed → pending_payment. */
-    private function markSessionOpenedTx(int $orderId, int $paymentId, PaymentSession $s, int $userId): bool
+    /**
+     * Tx2 (успех): orders → payments. created → pending + данные сессии; заказ draft/payment_failed →
+     * pending_payment, если это последняя попытка.
+     *
+     * @return ?string null — сессия действует; иначе статус заказа, для которого платёж уже закрыт.
+     */
+    private function markSessionOpenedTx(int $orderId, int $paymentId, PaymentSession $s, int $userId): ?string
     {
         $t = $this->tables();
         $order = $this->row('SELECT id, status FROM %i WHERE id = %d FOR UPDATE', $t['orders'], $orderId);
-        $payment = $this->row('SELECT id, status FROM %i WHERE id = %d FOR UPDATE', $t['payments'], $paymentId);
+        $payment = $this->row('SELECT id, status, attempt_no FROM %i WHERE id = %d FOR UPDATE', $t['payments'], $paymentId);
         if ($order === null || $payment === null) {
             throw new \RuntimeException('order/payment vanished');
         }
+        $status = (string) $payment['status'];
 
-        if ($payment['status'] === 'created') {
+        if ($status === 'created') {
             $this->expectAffected($this->exec(
                 "UPDATE %i
-                    SET provider_payment_id = %s, session_expires_at = %s, provider_status = %s, status = 'pending'
+                    SET provider_payment_id = %s, session_expires_at = %s, session_redirect_url = %s,
+                        provider_status = %s, status = 'pending'
                   WHERE id = %d AND status = 'created'",
                 $t['payments'],
                 $s->providerPaymentId,
                 $s->expiresAtSql(),
+                $s->redirectUrl,
                 $s->providerStatus,
                 $paymentId
             ), 1, 'payment created → pending');
             $this->audit->record('payment.status_changed', 'payment', $paymentId, 'created', 'pending', ['order_id' => $orderId], 'user', $userId);
+            $status = 'pending';
         } else {
-            // Webhook успел раньше (created → pending/… уже проведён): только дописываем недостающее.
+            // Webhook успел раньше или это повтор с тем же ключом: только дописываем недостающее.
             $this->exec(
                 'UPDATE %i SET provider_payment_id = COALESCE(provider_payment_id, %s),
-                               session_expires_at = COALESCE(session_expires_at, %s)
+                               session_expires_at = COALESCE(session_expires_at, %s),
+                               session_redirect_url = COALESCE(session_redirect_url, %s)
                   WHERE id = %d',
                 $t['payments'],
                 $s->providerPaymentId,
                 $s->expiresAtSql(),
+                $s->redirectUrl,
                 $paymentId
             );
         }
 
-        $current = (string) $this->scalar('SELECT status FROM %i WHERE id = %d', $t['payments'], $paymentId);
-        if ($current === 'pending' && in_array($order['status'], ['draft', 'payment_failed'], true)) {
+        if (\in_array($status, ['failed', 'cancelled', 'expired'], true)) {
+            return (string) $order['status'];
+        }
+        $latest = (int) $this->scalar('SELECT MAX(attempt_no) FROM %i WHERE order_id = %d', $t['payments'], $orderId);
+        if ($status === 'pending' && (int) $payment['attempt_no'] === $latest
+            && \in_array($order['status'], ['draft', 'payment_failed'], true)) {
             $this->expectAffected($this->exec(
                 "UPDATE %i SET status = 'pending_payment' WHERE id = %d AND status IN ('draft', 'payment_failed')",
                 $t['orders'],
@@ -755,15 +794,20 @@ final class CheckoutService
             $this->audit->record('order.status_changed', 'order', $orderId, (string) $order['status'], 'pending_payment', ['payment_id' => $paymentId], 'user', $userId);
         }
 
-        return true;
+        return null;
     }
 
-    /** Tx2 (ошибка банка): payment created → failed; order draft → payment_failed. Экземпляры остаются за заказом. */
+    /**
+     * Tx2 (ошибка банка): payment created → cancelled (failure_code session_create_failed; created → failed
+     * контракт не допускает — failed означает ответ банка по открытой сессии); заказ draft/pending_payment →
+     * payment_failed, если это последняя попытка. Экземпляры остаются за заказом до payment_due_at:
+     * покупатель может повторить /pay.
+     */
     private function markSessionFailedTx(int $orderId, int $paymentId, int $userId): string
     {
         $t = $this->tables();
         $order = $this->row('SELECT id, status FROM %i WHERE id = %d FOR UPDATE', $t['orders'], $orderId);
-        $payment = $this->row('SELECT id, status FROM %i WHERE id = %d FOR UPDATE', $t['payments'], $paymentId);
+        $payment = $this->row('SELECT id, status, attempt_no FROM %i WHERE id = %d FOR UPDATE', $t['payments'], $paymentId);
         if ($order === null || $payment === null) {
             throw new \RuntimeException('order/payment vanished');
         }
@@ -771,24 +815,27 @@ final class CheckoutService
             return (string) $order['status']; // сессия уже существует у банка (повтор) — статусы не трогаем
         }
         $this->expectAffected($this->exec(
-            "UPDATE %i SET failure_code = 'session_create_failed', status = 'failed' WHERE id = %d AND status = 'created'",
+            "UPDATE %i SET failure_code = 'session_create_failed', status = 'cancelled' WHERE id = %d AND status = 'created'",
             $t['payments'],
             $paymentId
-        ), 1, 'payment created → failed');
-        $this->audit->record('payment.status_changed', 'payment', $paymentId, 'created', 'failed', ['reason' => 'session_create_failed'], 'user', $userId);
+        ), 1, 'payment created → cancelled');
+        $this->audit->record('payment.status_changed', 'payment', $paymentId, 'created', 'cancelled', ['reason' => 'session_create_failed'], 'user', $userId);
 
-        if ($order['status'] === 'draft') {
+        $latest = (int) $this->scalar('SELECT MAX(attempt_no) FROM %i WHERE order_id = %d', $t['payments'], $orderId);
+        $from = (string) $order['status'];
+        if ((int) $payment['attempt_no'] === $latest && \in_array($from, ['draft', 'pending_payment'], true)) {
             $this->expectAffected($this->exec(
-                "UPDATE %i SET status = 'payment_failed' WHERE id = %d AND status = 'draft'",
+                "UPDATE %i SET status = 'payment_failed' WHERE id = %d AND status = %s",
                 $t['orders'],
-                $orderId
-            ), 1, 'order draft → payment_failed');
-            $this->audit->record('order.status_changed', 'order', $orderId, 'draft', 'payment_failed', ['payment_id' => $paymentId], 'user', $userId);
+                $orderId,
+                $from
+            ), 1, 'order → payment_failed');
+            $this->audit->record('order.status_changed', 'order', $orderId, $from, 'payment_failed', ['payment_id' => $paymentId], 'user', $userId);
 
             return 'payment_failed';
         }
 
-        return (string) $order['status'];
+        return $from;
     }
 
     // =================================================================================================
@@ -796,8 +843,8 @@ final class CheckoutService
     // =================================================================================================
 
     /**
-     * Отмена покупателем: только draft / pending_payment / payment_failed (в payment_processing деньги
-     * в пути — ждём итог банка). Экземпляры → release target. Повтор отмены — 200 без изменений.
+     * Отмена покупателем: только draft / pending_payment / payment_failed и без денег в пути. Экземпляры →
+     * release target. Повтор отмены — 200 без изменений; иначе 409 uniundata_order_not_cancellable.
      *
      * @return array{order: array<string, mixed>, changed: bool}
      */
@@ -823,24 +870,20 @@ final class CheckoutService
         );
         $order = $this->row('SELECT id, user_id, status FROM %i WHERE id = %d FOR UPDATE', $t['orders'], $orderId);
         if ($order === null || (int) $order['user_id'] !== $userId) {
-            throw new DomainError('uniundata_order_not_found', \__('Order not found.', 'uniundata-books'), 404);
+            throw DomainError::orderNotFound();
         }
         $status = (string) $order['status'];
         if ($status === 'cancelled') {
             return ['changed' => false, 'cancel_sessions' => []];
-        }
-        if (!in_array($status, self::PAYABLE_ORDER_STATUSES, true)) {
-            throw new DomainError('uniundata_order_not_payable', \__('This order can no longer be cancelled.', 'uniundata-books'), 409, ['order_status' => $status]);
         }
         $payments = $this->rows(
             'SELECT id, status, provider_payment_id, idempotency_key FROM %i WHERE order_id = %d ORDER BY attempt_no FOR UPDATE',
             $t['payments'],
             $orderId
         );
-        foreach ($payments as $p) {
-            if (in_array($p['status'], ['processing', 'succeeded'], true)) {
-                throw new DomainError('uniundata_order_not_payable', \__('This order can no longer be cancelled.', 'uniundata-books'), 409, ['order_status' => $status]);
-            }
+        $moneyInFlight = array_filter($payments, static fn (array $p): bool => \in_array($p['status'], self::MONEY_IN_FLIGHT, true));
+        if (!\in_array($status, self::PAYABLE_ORDER_STATUSES, true) || $moneyInFlight !== []) {
+            throw DomainError::orderNotCancellable($status);
         }
 
         $this->expectAffected($this->exec(
@@ -853,26 +896,18 @@ final class CheckoutService
 
         $cancel = [];
         foreach ($payments as $p) {
-            // По контракту created → pending|failed, pending → cancelled.
-            $to = match ($p['status']) {
-                'created' => 'failed',
-                'pending' => 'cancelled',
-                default => null,
-            };
-            if ($to === null) {
+            // created|pending → cancelled (контракт v2); failed/expired/cancelled уже закрыты.
+            if (!\in_array($p['status'], ['created', 'pending'], true)) {
                 continue;
             }
             $this->expectAffected($this->exec(
-                'UPDATE %i SET failure_code = IF(%s = \'failed\', \'order_cancelled\', failure_code), status = %s
-                  WHERE id = %d AND status = %s',
+                "UPDATE %i SET failure_code = 'order_cancelled', status = 'cancelled' WHERE id = %d AND status = %s",
                 $t['payments'],
-                $to,
-                $to,
                 (int) $p['id'],
                 (string) $p['status']
-            ), 1, 'payment → ' . $to);
-            $this->audit->record('payment.status_changed', 'payment', (int) $p['id'], (string) $p['status'], $to, ['reason' => 'order_cancelled'], 'user', $userId);
-            if ($p['status'] === 'pending' && $p['provider_payment_id'] !== null) {
+            ), 1, 'payment → cancelled');
+            $this->audit->record('payment.status_changed', 'payment', (int) $p['id'], (string) $p['status'], 'cancelled', ['reason' => 'order_cancelled'], 'user', $userId);
+            if ($p['provider_payment_id'] !== null) {
                 $cancel[] = $p;
             }
         }
@@ -904,7 +939,7 @@ final class CheckoutService
               WHERE id IN (" . $this->in($pending) . ") AND availability_status = 'checkout_pending'",
             $this->db->table('book_items'),
             ...$pending
-        ), count($pending), 'items → release target');
+        ), \count($pending), 'items → release target');
         foreach ($pending as $id) {
             $this->audit->record('item.status_changed', 'item', $id, 'checkout_pending', $this->releaseTarget((string) $items[$id]['source_status']), ['order_id' => $orderId, 'reason' => $reason], 'user', $userId);
         }
@@ -918,7 +953,7 @@ final class CheckoutService
                 $this->provider->cancelSession((string) $p['provider_payment_id'], (string) $p['idempotency_key']);
             } catch (\Throwable $e) {
                 // Best effort: сессия всё равно истечёт по TTL; поздняя оплата пойдёт веткой позднего платежа.
-                error_log(sprintf('[uniundata] cancelSession failed for payment #%d: %s', (int) $p['id'], $e::class));
+                error_log(\sprintf('[uniundata] cancelSession failed for payment #%d: %s', (int) $p['id'], $e::class));
             }
         }
     }
@@ -927,24 +962,29 @@ final class CheckoutService
     // Снимки, настройки, представление
     // =================================================================================================
 
-    /** @return array{email: string, first_name: string, last_name: string, middle_name: ?string, phone: ?string} */
+    /**
+     * Снимок покупателя для заказа: значения из customer{} запроса, иначе из профиля (usermeta
+     * first_name/last_name/middle_name, wp_book_customer_profiles.phone_e164). Отчество необязательно.
+     *
+     * @return array{email: string, first_name: string, last_name: string, middle_name: ?string, phone: ?string}
+     */
     private function customerSnapshot(int $userId, CheckoutRequest $req): array
     {
         $user = get_userdata($userId);
         if ($user === false) {
-            throw new DomainError('uniundata_auth_required', \__('Please log in to continue.', 'uniundata-books'), 401);
+            throw DomainError::authRequired();
         }
         $email = (string) $user->user_email;
-        $first = trim((string) get_user_meta($userId, 'first_name', true));
-        $last = trim((string) get_user_meta($userId, 'last_name', true));
-        $middle = trim((string) get_user_meta($userId, 'middle_name', true)); // необязательное поле
-        foreach (['first_name' => $first, 'last_name' => $last] as $param => $v) {
-            if ($v === '' || mb_strlen($v) > 100) {
-                throw new DomainError('uniundata_invalid_param', \__('Please complete your name in the profile.', 'uniundata-books'), 400, ['param' => $param]);
-            }
+        if (!is_email($email) || \strlen($email) > 254) {
+            throw DomainError::invalidParam('email', \__('Please provide a valid e-mail in your profile.', 'uniundata-books'));
         }
-        if (!is_email($email) || strlen($email) > 254) {
-            throw new DomainError('uniundata_invalid_param', \__('Please provide a valid e-mail in the profile.', 'uniundata-books'), 400, ['param' => 'email']);
+        $first = $req->firstName ?? $this->profileName($userId, 'first_name');
+        $last = $req->lastName ?? $this->profileName($userId, 'last_name');
+        if ($first === null) {
+            throw DomainError::invalidParam('customer.first_name', \__('Please enter your first name.', 'uniundata-books'));
+        }
+        if ($last === null) {
+            throw DomainError::invalidParam('customer.last_name', \__('Please enter your last name.', 'uniundata-books'));
         }
         $phone = $req->phone ?? $this->scalar(
             'SELECT phone_e164 FROM %i WHERE user_id = %d',
@@ -956,38 +996,60 @@ final class CheckoutService
             'email' => $email,
             'first_name' => $first,
             'last_name' => $last,
-            'middle_name' => $middle !== '' && mb_strlen($middle) <= 100 ? $middle : null,
+            'middle_name' => $req->middleName ?? $this->profileName($userId, 'middle_name'),
             'phone' => $phone,
         ];
+    }
+
+    /** Имя из usermeta; значение, не проходящее проверку формата, считается незаполненным. */
+    private function profileName(int $userId, string $metaKey): ?string
+    {
+        $value = CheckoutRequest::normalizeName((string) get_user_meta($userId, $metaKey, true));
+
+        return $value !== null && CheckoutRequest::isValidName($value) ? $value : null;
     }
 
     /**
      * Текущие редакции оферты и политики из option uniundata_terms_versions:
      * ['offer' => ['version' => '2026-09', 'sha256' => '<64 hex>'], 'privacy' => [...]].
+     * Покупатель принял устаревшую редакцию → 409 uniundata_terms_outdated (data.current_versions):
+     * клиент показывает новую редакцию и запрашивает согласие заново.
      *
-     * @return array<string, array<string, string>>
+     * @return array<string, array{version: string, sha256: string}>
      */
     private function termsSnapshot(CheckoutRequest $req): array
     {
         $terms = get_option('uniundata_terms_versions', []);
         $out = [];
+        $current = [];
+        $outdated = false;
         foreach (['offer' => $req->acceptOfferVersion, 'privacy' => $req->acceptPrivacyVersion] as $type => $accepted) {
-            $cur = is_array($terms) ? ($terms[$type] ?? null) : null;
-            if (!is_array($cur) || !isset($cur['version'], $cur['sha256']) || !preg_match('/^[0-9a-f]{64}$/', (string) $cur['sha256'])) {
+            $cur = \is_array($terms) ? ($terms[$type] ?? null) : null;
+            if (!\is_array($cur) || !isset($cur['version'], $cur['sha256']) || !preg_match('/^[0-9a-f]{64}$/', (string) $cur['sha256'])) {
                 error_log('[uniundata] option uniundata_terms_versions is not configured');
-                throw new DomainError('uniundata_internal', \__('Internal error.', 'uniundata-books'), 500);
+                throw DomainError::internal();
             }
-            if ($accepted !== (string) $cur['version']) {
-                // Покупатель принял устаревшую редакцию: показать новую и запросить согласие заново.
-                throw new DomainError('uniundata_invalid_param', \__('The terms have been updated. Please review and accept them.', 'uniundata-books'), 400, [
-                    'param' => 'accept_' . $type . '_version',
-                    'current_version' => (string) $cur['version'],
-                ]);
-            }
-            $out[$type] = ['version' => (string) $cur['version'], 'sha256' => (string) $cur['sha256']];
+            $current[$type] = (string) $cur['version'];
+            $outdated = $outdated || $accepted !== $current[$type];
+            $out[$type] = ['version' => $current[$type], 'sha256' => (string) $cur['sha256']];
+        }
+        if ($outdated) {
+            throw DomainError::termsOutdated($current);
         }
 
         return $out;
+    }
+
+    /** Валюта магазина (option uniundata_currency, ISO 4217). Не настроена — ошибка конфигурации. */
+    private function shopCurrency(): string
+    {
+        $currency = get_option('uniundata_currency');
+        if (!\is_string($currency) || preg_match('/^[A-Z]{3}$/', $currency) !== 1) {
+            error_log('[uniundata] option uniundata_currency is not configured');
+            throw DomainError::internal();
+        }
+
+        return $currency;
     }
 
     /** @return array{0: int, 1: int} [payment_ttl_minutes, payment_grace_minutes] */
@@ -997,6 +1059,34 @@ final class CheckoutService
         $grace = (int) get_option('uniundata_payment_grace_minutes', 10);
 
         return [max(5, min(180, $ttl)), max(0, min(60, $grace))];
+    }
+
+    /** Чек «приход»: книги заказа по снимкам (название, цена, количество 1) + доставка, контакт покупателя. */
+    private function receiptForOrder(int $orderId, int $paymentAmount): FiscalReceipt
+    {
+        $t = $this->tables();
+        $order = $this->row(
+            'SELECT customer_email, customer_phone, shipping_amount FROM %i WHERE id = %d',
+            $t['orders'],
+            $orderId
+        );
+        if ($order === null) {
+            throw new \RuntimeException('order not found for receipt');
+        }
+        $lines = array_map(static fn (array $r): array => [
+            'title' => (string) $r['title_snapshot'],
+            'amount' => (int) $r['unit_price_amount'],
+            'book_item_id' => (int) $r['book_item_id'],
+        ], $this->rows(
+            'SELECT book_item_id, title_snapshot, unit_price_amount FROM %i WHERE order_id = %d ORDER BY id',
+            $t['order_items'],
+            $orderId
+        ));
+        if ((int) $order['shipping_amount'] > 0) {
+            $lines[] = ['title' => \__('Delivery', 'uniundata-books'), 'amount' => (int) $order['shipping_amount'], 'book_item_id' => null, 'subject' => 'service'];
+        }
+
+        return FiscalReceipt::fromLines($lines, (string) $order['customer_email'], $order['customer_phone'], $orderId, $paymentAmount, 'payment');
     }
 
     /** @return ?array<string, mixed> */
@@ -1014,7 +1104,7 @@ final class CheckoutService
     private function findOwnOrderId(int $userId, string $publicOrderId): int
     {
         if (!preg_match('/^uniundata_[0-9a-f-]{36}$/', $publicOrderId)) {
-            throw new DomainError('uniundata_order_not_found', \__('Order not found.', 'uniundata-books'), 404);
+            throw DomainError::orderNotFound();
         }
         $row = $this->row(
             'SELECT id, user_id FROM %i WHERE public_order_id = %s',
@@ -1022,7 +1112,7 @@ final class CheckoutService
             $publicOrderId
         );
         if ($row === null || (int) $row['user_id'] !== $userId) {
-            throw new DomainError('uniundata_order_not_found', \__('Order not found.', 'uniundata-books'), 404);
+            throw DomainError::orderNotFound();
         }
 
         return (int) $row['id'];
@@ -1044,7 +1134,7 @@ final class CheckoutService
         $t = $this->tables();
         $o = $this->row(
             'SELECT public_order_id, status, currency, subtotal_amount, discount_amount, shipping_amount, tax_amount,
-                    total_amount, placed_at, payment_due_at, paid_at, cancelled_at
+                    total_amount, refunded_amount, placed_at, payment_due_at, paid_at, cancelled_at
                FROM %i WHERE id = %d',
             $t['orders'],
             $orderId
@@ -1068,10 +1158,11 @@ final class CheckoutService
             'shipping_amount' => (int) $o['shipping_amount'],
             'tax_amount' => (int) $o['tax_amount'],
             'total_amount' => (int) $o['total_amount'],
-            'placed_at' => $this->iso($o['placed_at']),
-            'payment_due_at' => $this->iso($o['payment_due_at']),
-            'paid_at' => $this->iso($o['paid_at']),
-            'cancelled_at' => $this->iso($o['cancelled_at']),
+            'refunded_amount' => (int) $o['refunded_amount'],
+            'placed_at' => Db::toIso8601($o['placed_at']),
+            'payment_due_at' => Db::toIso8601($o['payment_due_at']),
+            'paid_at' => Db::toIso8601($o['paid_at']),
+            'cancelled_at' => Db::toIso8601($o['cancelled_at']),
             'items' => array_map(static fn (array $i): array => [
                 'book_item_id' => (int) $i['book_item_id'],
                 'title' => (string) $i['title_snapshot'],
@@ -1084,11 +1175,6 @@ final class CheckoutService
         ];
     }
 
-    private function notPayable(string $status): DomainError
-    {
-        return new DomainError('uniundata_order_not_payable', \__('This order cannot be paid.', 'uniundata-books'), 409, ['order_status' => $status]);
-    }
-
     private function releaseTarget(string $sourceStatus): string
     {
         return match ($sourceStatus) {
@@ -1099,7 +1185,7 @@ final class CheckoutService
     }
 
     // =================================================================================================
-    // SQL-хелперы: только $wpdb->prepare(), ошибки → исключение (Db::transaction() откатит и повторит 1213/1205)
+    // SQL-хелперы поверх Db: prepare(), ошибка MySQL → \mysqli_sql_exception (Db::transaction() откатит и повторит 1213/1205)
     // =================================================================================================
 
     /** @return array<string, string> */
@@ -1118,74 +1204,50 @@ final class CheckoutService
     }
 
     /** @return ?array<string, mixed> */
-    private function row(string $sql, mixed ...$args): ?array
+    private function row(string $sql, int|string|float ...$args): ?array
     {
-        $r = $this->wpdb->get_row($this->wpdb->prepare($sql, ...$args), ARRAY_A);
-        $this->assertNoDbError();
-
-        return is_array($r) ? $r : null;
+        return $this->db->getRow($sql, ...$args);
     }
 
     /** @return list<array<string, mixed>> */
-    private function rows(string $sql, mixed ...$args): array
+    private function rows(string $sql, int|string|float ...$args): array
     {
-        $r = $this->wpdb->get_results($this->wpdb->prepare($sql, ...$args), ARRAY_A);
-        $this->assertNoDbError();
-
-        return is_array($r) ? $r : [];
+        return $this->db->getResults($sql, ...$args);
     }
 
     /** @return array<int, array<string, mixed>> */
-    private function rowsById(string $sql, mixed ...$args): array
+    private function rowsById(string $sql, int|string|float ...$args): array
     {
         $out = [];
-        foreach ($this->rows($sql, ...$args) as $r) {
+        foreach ($this->db->getResults($sql, ...$args) as $r) {
             $out[(int) $r['id']] = $r;
         }
 
         return $out;
     }
 
-    /** @return list<string> */
-    private function col(string $sql, mixed ...$args): array
+    /** @return list<string> Первая колонка результата. */
+    private function col(string $sql, int|string|float ...$args): array
     {
-        $r = $this->wpdb->get_col($this->wpdb->prepare($sql, ...$args));
-        $this->assertNoDbError();
-
-        return array_values(array_map('strval', $r));
+        return array_map(static fn (array $r): string => (string) array_values($r)[0], $this->db->getResults($sql, ...$args));
     }
 
-    private function scalar(string $sql, mixed ...$args): ?string
+    private function scalar(string $sql, int|string|float ...$args): ?string
     {
-        $r = $this->wpdb->get_var($this->wpdb->prepare($sql, ...$args));
-        $this->assertNoDbError();
-
-        return $r === null ? null : (string) $r;
+        return $this->db->getVar($sql, ...$args);
     }
 
-    /** INSERT/UPDATE: число изменённых строк (mysqli без CLIENT_FOUND_ROWS). */
-    private function exec(string $sql, mixed ...$args): int
+    /** INSERT/UPDATE: число изменённых строк (UPDATE теми же значениями даёт 0). Ошибка MySQL → исключение. */
+    private function exec(string $sql, int|string|float ...$args): int
     {
-        $r = $this->wpdb->query($this->wpdb->prepare($sql, ...$args));
-        if ($r === false) {
-            throw new \RuntimeException('DB error: ' . $this->wpdb->last_error, $this->db->lastErrno());
-        }
-
-        return (int) $r;
-    }
-
-    private function assertNoDbError(): void
-    {
-        if ($this->wpdb->last_error !== '') {
-            throw new \RuntimeException('DB error: ' . $this->wpdb->last_error, $this->db->lastErrno());
-        }
+        return $this->db->execute($sql, ...$args);
     }
 
     /** Переход под блокировкой обязан затронуть ровно ожидаемое число строк; иначе — ошибка логики, откат. */
     private function expectAffected(int $actual, int $expected, string $what): void
     {
         if ($actual !== $expected) {
-            throw new \RuntimeException(sprintf('Unexpected affected rows for %s: %d instead of %d', $what, $actual, $expected));
+            throw new \RuntimeException(\sprintf('Unexpected affected rows for %s: %d instead of %d', $what, $actual, $expected));
         }
     }
 
@@ -1201,15 +1263,6 @@ final class CheckoutService
     /** @param list<int> $ids */
     private function in(array $ids): string
     {
-        return implode(',', array_fill(0, count($ids), '%d'));
-    }
-
-    private function iso(mixed $dbDatetime): ?string
-    {
-        if ($dbDatetime === null || $dbDatetime === '') {
-            return null;
-        }
-
-        return (new \DateTimeImmutable((string) $dbDatetime, new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s\Z');
+        return implode(',', array_fill(0, \count($ids), '%d'));
     }
 }

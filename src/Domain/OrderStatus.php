@@ -34,7 +34,8 @@ enum OrderStatus: string
             self::Paid => [self::Fulfilled, self::Refunded, self::PartiallyRefunded],
             self::Fulfilled => [self::Completed, self::Refunded, self::PartiallyRefunded],
             self::Completed => [self::Refunded, self::PartiallyRefunded],
-            self::PartiallyRefunded => [self::Refunded],
+            // Частичный возврат не останавливает выполнение заказа: отгрузка и закрытие продолжаются.
+            self::PartiallyRefunded => [self::Fulfilled, self::Completed, self::Refunded],
             self::Refunded => [],
         };
     }
@@ -50,7 +51,7 @@ enum OrderStatus: string
         return $to === self::Paid && ($this === self::PaymentExpired || $this === self::Cancelled);
     }
 
-    /** Деньги получены; в БД такие статусы требуют paid_at (ck_orders_paid_at). */
+    /** Деньги получены; в БД такие статусы требуют paid_at (wp_book_orders_chk_paid_at). */
     public function isPaid(): bool
     {
         return \in_array($this, [self::Paid, self::Fulfilled, self::Completed, self::Refunded, self::PartiallyRefunded], true);

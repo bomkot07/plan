@@ -10,7 +10,8 @@ use Uniundata\Books\Payment\WebhookResult;
 use Uniundata\Books\Service\PaymentService;
 
 /**
- * POST /payment/webhook — серверный callback банка. Единственный источник факта оплаты.
+ * POST /payment/webhook — серверный callback банка. Единственный источник факта оплаты (второй путь к тому
+ * же PaymentService::applyProviderResult() — опрос банка cron-ом).
  *
  * Аутентификация — подпись банка, а не WordPress:
  *  - у банка нет WordPress-сессии и nonce; cookie он не присылает, get_current_user_id() = 0 и не используется;
@@ -18,12 +19,18 @@ use Uniundata\Books\Service\PaymentService;
  *    эффектов: необязательный IP allowlist приложения (константа UNIUNDATA_WEBHOOK_ALLOWED_IPS);
  *  - криптографическая проверка подписи — первый шаг PaymentService::handleWebhook() в callback, ДО любой
  *    записи в БД. Почему не в permission_callback: verifyWebhook() одновременно проверяет и разбирает событие
- *    (результат нужен дальше — одна проверка, один разбор), а коды ответа банку (401 подпись, 400 тело,
- *    413 размер, 5xx «повторите») задаёт единая политика WebhookResult. Безопасность та же: до проверки
- *    подписи callback ничего не пишет и не меняет.
+ *    (одна проверка, один разбор), а коды ответа банку (401 подпись, 400 тело, 413 размер, 5xx «повторите»)
+ *    задаёт единая политика WebhookResult.
  *
- * Подпись считается по СЫРОМУ телу $request->get_body(): get_json_params() — уже пересобранный массив,
- * его повторная сериализация не совпадёт с байтами, которые подписал банк.
+ * Подпись считается по СЫРОМУ телу $request->get_body(): get_json_params() — уже пересобранный массив.
+ * Если банк кладёт подпись в заголовок Authorization, на Apache + PHP-FPM он доходит до PHP только при
+ * `RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]` или `CGIPassAuth On` (docs/06 § 6.5.4).
+ *
+ * Отклонённые доставки (401/400/413) считаются по IP клиента в транзиентах (RestController::bumpCounter —
+ * работает и без постоянного объектного кэша): после DEFAULT_RATE_LIMITS['webhook_rejected'] за окно
+ * следующие запросы с этого IP получают 429 без проверки подписи и без записи в БД/аудит. Принятые
+ * доставки не считаются, поэтому банк с верной подписью лимит не исчерпывает. При включённом allowlist
+ * лимит не применяется: чужие IP и так получают 403.
  *
  * Коды ответа (банки повторяют доставку при любом не-2xx):
  *   200 — обработано, дубль (provider_event_id уже processed) или событие не требует действий;
@@ -31,6 +38,7 @@ use Uniundata\Books\Service\PaymentService;
  *   401 — подпись/timestamp не прошли; в БД ничего не записано;
  *   403 — IP не из allowlist (если allowlist включён);
  *   413 — тело больше 64 КБ;
+ *   429 — с этого IP слишком много отклонённых доставок (Retry-After);
  *   500/503 — временная ошибка (deadlock после повторов, API банка недоступно): событие помечено failed,
  *             банк повторит, обработка продолжится с того же места.
  */
@@ -56,8 +64,8 @@ final class PaymentWebhookController extends RestController
     }
 
     /**
-     * Транспортный фильтр без побочных эффектов. Основная защита allowlist-ом/mTLS — на веб-сервере
-     * (nginx/LB), этот слой — на случай, если веб-сервер настроить нельзя.
+     * Транспортный фильтр без побочных эффектов. Срабатывает после разрешения маршрута WordPress-ом, поэтому
+     * закрывает все варианты URL (/wp-json/…, ?rest_route=…). Allowlist на Apache — дополнительный слой.
      */
     public function permitWebhook(\WP_REST_Request $request): bool|\WP_Error
     {
@@ -79,6 +87,14 @@ final class PaymentWebhookController extends RestController
     public function handle(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
     {
         $started = microtime(true);
+        $limit = $this->rejectLimit();
+        if ($limit !== null && $this->readCounter($limit['subject'], $limit['window']) >= $limit['max']) {
+            $retryAfter = self::secondsToWindowEnd($limit['window']);
+            error_log(\sprintf('[uniundata] request_id=%s webhook outcome=rate_limited http=429 ip=%s', $this->audit->requestId(), $this->clientIp() ?? '-'));
+
+            return DomainError::rateLimited($retryAfter)->toWpError(); // Retry-After ставит rest_post_dispatch
+        }
+
         try {
             $result = $this->payments->handleWebhook($request->get_body(), $request->get_headers());
         } catch (\Throwable $e) {
@@ -89,6 +105,9 @@ final class PaymentWebhookController extends RestController
         }
 
         $this->logResult($result, $started);
+        if ($limit !== null && \in_array($result->outcome, [WebhookResult::OUTCOME_INVALID_SIGNATURE, WebhookResult::OUTCOME_BAD_REQUEST], true)) {
+            $this->bumpCounter($limit['subject'], $limit['window']);
+        }
 
         if ($result->httpStatus === 401) {
             return DomainError::invalidSignature()->toWpError();
@@ -99,6 +118,23 @@ final class PaymentWebhookController extends RestController
         }
 
         return $response;
+    }
+
+    /**
+     * Лимит отклонённых доставок с IP клиента; null — не применяется (включён allowlist, IP неизвестен
+     * или лимит отключён фильтром uniundata_rate_limits).
+     *
+     * @return array{subject: string, max: int, window: int}|null
+     */
+    private function rejectLimit(): ?array
+    {
+        $ip = $this->clientIp();
+        $ipLimit = self::rateLimits('webhook_rejected')['ip'] ?? null;
+        if ($ip === null || $ipLimit === null || self::allowedNetworks() !== []) {
+            return null;
+        }
+
+        return ['subject' => 'webhook_rejected|ip|' . $ip, 'max' => $ipLimit[0], 'window' => $ipLimit[1]];
     }
 
     /**

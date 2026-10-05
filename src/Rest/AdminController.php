@@ -6,34 +6,40 @@ namespace Uniundata\Books\Rest;
 
 use Uniundata\Books\Domain\DomainError;
 use Uniundata\Books\Domain\ItemStatus;
+use Uniundata\Books\Domain\ReservationStatus;
 use Uniundata\Books\Infrastructure\AuditLog;
 use Uniundata\Books\Infrastructure\Db;
 use Uniundata\Books\Service\ReservationService;
+use Uniundata\Books\Sync\SourceClientInterface;
+use Uniundata\Books\Sync\SyncService;
 
 /**
  * Административные действия. Вызываются из wp-admin (cookie + X-WP-Nonce) или скриптами персонала
  * через Application Passwords (только HTTPS). Маршруты скрыты из индекса /wp-json (show_in_index=false),
- * но защищены capability, а не скрытием.
+ * но защищены capability, а не скрытием. Права — как в docs/07 § 7.2:
  *
  *   POST /admin/reservations/{id}/release — manage_book_reservations: снять резерв, попытка возвращается;
- *   POST /admin/items/{id}/block          — manage_book_catalog: available → blocked;
- *   POST /admin/items/{id}/unblock        — manage_book_catalog: blocked → available;
+ *   POST /admin/items/{id}/block          — manage_book_catalog: available → blocked; экземпляр в чужой
+ *                                           корзине (reserved) — дополнительно manage_book_reservations:
+ *                                           released_by_admin + blocked в одной транзакции; checkout_pending —
+ *                                           409 (сначала отмена заказа менеджером заказов);
+ *   POST /admin/items/{id}/unblock        — manage_book_catalog: blocked → release target по source_status
+ *                                           (available | sync_missing | withdrawn);
  *   POST /admin/sync/run                  — manage_book_sync: поставить синхронизацию в Action Scheduler (202);
  *   GET  /admin/sync/runs                 — manage_book_sync: журнал прогонов.
  */
 final class AdminController extends RestController
 {
     /**
-     * Action Scheduler hook синхронизации (регистрирует src/Cron/Scheduler.php). Ручной запуск ставит
+     * Action Scheduler hook синхронизации (= Cron\Scheduler::HOOK_SYNC_DAILY). Ручной запуск ставит
      * разовую async-задачу с args [triggered_by, source]; AS передаёт их обработчику позиционно.
      */
     public const HOOK_SYNC = 'uniundata_sync_daily';
     public const AS_GROUP = 'uniundata';
 
-    /** heartbeat старше этого — прогон считается зависшим, новую задачу можно ставить (SyncService его прервёт). */
-    private const STALE_HEARTBEAT_SECONDS = 600;
     private const SYNC_STATUSES = ['running', 'succeeded', 'partial', 'failed', 'aborted'];
-    private const SOURCE_PATTERN = '^[a-z0-9_]{1,64}$';
+    /** Имя источника — как проверяет SyncService::__construct() (и ≤ 64 символов имени GET_LOCK). */
+    private const SOURCE_PATTERN = '^[a-z0-9_-]{1,32}$';
 
     public function __construct(
         AuditLog $audit,
@@ -59,6 +65,7 @@ final class AdminController extends RestController
         ]);
 
         foreach (['block' => true, 'unblock' => false] as $action => $block) {
+            // Базовое право — каталог; блокировка экземпляра в чужой корзине дополнительно проверяется в callback.
             register_rest_route(self::NAMESPACE, '/admin/items/(?P<id>\d+)/' . $action, [
                 'methods' => \WP_REST_Server::CREATABLE,
                 'callback' => fn (\WP_REST_Request $r): \WP_REST_Response|\WP_Error => $this->setBlocked($r, $block),
@@ -77,7 +84,7 @@ final class AdminController extends RestController
             'permission_callback' => $this->requireCapability('manage_book_sync'),
             'args' => [
                 'source' => [
-                    'description' => 'Код источника (wp_book_sync_runs.source_name).',
+                    'description' => 'Код источника (wp_book_sync_runs.source_name), зарегистрированного фильтром uniundata_sync_sources.',
                     'type' => 'string',
                     'pattern' => self::SOURCE_PATTERN,
                     'default' => 'primary',
@@ -160,10 +167,17 @@ final class AdminController extends RestController
     // =============================================================================================
 
     /**
-     * По контракту: available → blocked и blocked → available. reserved/checkout_pending сначала освобождаются
-     * (release резерва / отмена заказа), sold — терминальный. Повтор (уже blocked / уже available) — 200, changed=false.
-     * Блокируется только строка экземпляра (уровень 2 порядка блокировок): у available/blocked экземпляра нет
-     * активного резерва и открытого заказа, поэтому корзины и заказы не затрагиваются.
+     * block:   available → blocked; повтор (уже blocked) — 200, changed=false.
+     *          reserved → сначала released_by_admin (attempt_no = NULL, попытка покупателю возвращается),
+     *          затем blocked — одна транзакция, нужна ещё manage_book_reservations (иначе 403). Если источник
+     *          сообщает missing/withdrawn, после освобождения экземпляр уже sync_missing/withdrawn и не продаётся —
+     *          блокировка не нужна, ответ 200 с этим статусом.
+     *          checkout_pending — 409 (data.required_action = cancel_order): держит заказ, сначала его отмена;
+     *          sold, withdrawn, sync_missing — 409 (из них в blocked перехода нет).
+     * unblock: blocked → release target по source_status; не blocked — 200, changed=false (нечего снимать).
+     *
+     * Порядок блокировок (docs/08): корзина резерва → экземпляр → резерв → позиция корзины. ID корзины и резерва
+     * читаются обычным SELECT до транзакции и перепроверяются после блокировки.
      */
     public function setBlocked(\WP_REST_Request $request, bool $block): \WP_REST_Response|\WP_Error
     {
@@ -172,65 +186,109 @@ final class AdminController extends RestController
             $adminId = $this->currentUserId();
             $itemId = (int) $request->get_param('id');
             $note = trim((string) $request->get_param('reason'));
+            $canRelease = current_user_can('manage_book_reservations');
 
-            $result = $this->db->transaction(function () use ($adminId, $itemId, $block, $note): array {
-                $item = $this->db->getRow(
-                    "SELECT id, availability_status, source_status
-                       FROM {$this->db->table('book_items')}
-                      WHERE id = %d
-                      FOR UPDATE",
-                    $itemId,
-                );
+            $ref = $block ? $this->db->getRow(
+                "SELECT id, cart_id FROM {$this->db->table('book_reservations')} WHERE active_book_item_id = %d",
+                $itemId,
+            ) : null;
+
+            $result = $this->db->transaction(function () use ($adminId, $itemId, $block, $note, $ref, $canRelease): array {
+                $cart = $ref !== null && $ref['cart_id'] !== null ? $this->reservations->lockCartById((int) $ref['cart_id']) : null; // 1
+                $item = $this->reservations->lockItem($itemId);                                                                       // 2
                 if ($item === null) {
                     throw DomainError::itemNotFound($itemId);
                 }
+                $from = ItemStatus::from($item['availability_status']);
+                $context = ['reason' => $block ? 'admin_block' : 'admin_unblock'] + ($note !== '' ? ['note' => $note] : []);
 
-                $from = ItemStatus::from((string) $item['availability_status']);
-                $to = $block ? ItemStatus::Blocked : ItemStatus::Available;
-                if ($from === $to) {
-                    return ['changed' => false, 'status' => $from->value];
-                }
-                $expectedFrom = $block ? ItemStatus::Available : ItemStatus::Blocked;
-                if ($from !== $expectedFrom || !$from->canTransitionTo($to)) {
-                    throw DomainError::itemUnavailable($itemId, $from->value);
-                }
-                if (!$block && $item['source_status'] !== 'present') {
-                    // Источник сообщает, что книги нет / снята: вернуть в продажу нельзя (контракт: blocked → available).
-                    throw new DomainError(
-                        'uniundata_item_unavailable',
-                        \__('The source reports this book as missing or withdrawn; it can not be put back on sale.', 'uniundata-books'),
-                        409,
-                        ['book_item_id' => $itemId, 'availability_status' => $from->value, 'source_status' => (string) $item['source_status']],
-                    );
+                if (!$block) {
+                    if ($from !== ItemStatus::Blocked) {
+                        return ['changed' => false, 'status' => $from->value, 'released_reservation_id' => null];
+                    }
+
+                    return $this->moveItem($itemId, $from, ItemStatus::releaseTarget($item['source_status']), $context, $adminId)
+                        + ['released_reservation_id' => null];
                 }
 
-                $changed = $this->db->execute(
-                    "UPDATE {$this->db->table('book_items')}
-                        SET availability_status = %s, status_changed_at = UTC_TIMESTAMP(6)
-                      WHERE id = %d AND availability_status = %s",
-                    $to->value,
-                    $itemId,
-                    $from->value,
-                );
-                if ($changed !== 1) {
-                    throw new \LogicException(\sprintf('Conditional update failed for item #%d %s → %s', $itemId, $from->value, $to->value));
+                $releasedId = null;
+                if ($from === ItemStatus::Reserved) {
+                    if (!$canRelease) {
+                        throw new DomainError(
+                            'uniundata_forbidden',
+                            \__('The book is in a customer cart: releasing it requires the manage_book_reservations capability.', 'uniundata-books'),
+                            403,
+                            ['book_item_id' => $itemId, 'availability_status' => $from->value, 'required_capability' => 'manage_book_reservations'],
+                        );
+                    }
+                    $reservation = $ref !== null ? $this->reservations->lockReservation((int) $ref['id']) : null;      // 3
+                    if ($reservation === null || $reservation['status'] !== ReservationStatus::Active->value
+                        || $reservation['book_item_id'] !== $itemId || $reservation['cart_id'] !== ($cart['id'] ?? null)) {
+                        // Пока брали блокировки, резерв сменился (истёк и экземпляр отложил другой): решение по
+                        // устаревшему чтению не принимаем — администратор повторяет действие.
+                        throw DomainError::itemUnavailable($itemId, $from->value, null, ['reason' => 'reservation_changed']);
+                    }
+                    $now = $this->db->now();
+                    $after = $this->reservations->releaseLocked(
+                        $reservation, $item, ReservationStatus::ReleasedByAdmin, 'admin_block', $now, 'admin', $adminId, $context,
+                    );                                                                                                    // 4
+                    if ($cart !== null) {
+                        $this->reservations->refreshCartLocked($cart, $now, false, null, 'admin', $adminId);
+                    }
+                    $releasedId = $reservation['id'];
+                    $from = ItemStatus::from($after);
+                    if ($from !== ItemStatus::Available) {
+                        return ['changed' => true, 'status' => $from->value, 'released_reservation_id' => $releasedId];
+                    }
                 }
 
-                $context = ['reason' => $block ? 'admin_block' : 'admin_unblock'];
-                if ($note !== '') {
-                    $context['note'] = $note;
+                if ($from === ItemStatus::Blocked) {
+                    return ['changed' => false, 'status' => $from->value, 'released_reservation_id' => null];
                 }
-                $this->audit->record('item.status_changed', 'item', $itemId, $from->value, $to->value, $context, 'admin', $adminId);
+                if ($from === ItemStatus::CheckoutPending) {
+                    throw DomainError::itemUnavailable($itemId, $from->value, null, ['required_action' => 'cancel_order']);
+                }
+                if (!$from->canTransitionTo(ItemStatus::Blocked)) {
+                    throw DomainError::itemUnavailable($itemId, $from->value); // sold, withdrawn, sync_missing
+                }
 
-                return ['changed' => true, 'status' => $to->value];
+                return $this->moveItem($itemId, $from, ItemStatus::Blocked, $context, $adminId) + ['released_reservation_id' => $releasedId];
             });
 
             return [
                 'book_item_id' => $itemId,
                 'availability_status' => $result['status'],
                 'changed' => $result['changed'],
+                'released_reservation_id' => $result['released_reservation_id'],
             ];
         });
+    }
+
+    /**
+     * Условный переход под уже взятой блокировкой экземпляра + аудит.
+     *
+     * @param array<string, mixed> $context
+     * @return array{changed: true, status: string}
+     */
+    private function moveItem(int $itemId, ItemStatus $from, ItemStatus $to, array $context, int $adminId): array
+    {
+        if (!$from->canTransitionTo($to)) {
+            throw new \LogicException(\sprintf('Transition %s → %s is not allowed for item #%d', $from->value, $to->value, $itemId));
+        }
+        $changed = $this->db->execute(
+            "UPDATE {$this->db->table('book_items')}
+                SET availability_status = %s, status_changed_at = UTC_TIMESTAMP(6)
+              WHERE id = %d AND availability_status = %s",
+            $to->value,
+            $itemId,
+            $from->value,
+        );
+        if ($changed !== 1) {
+            throw new \LogicException(\sprintf('Conditional update failed for item #%d %s → %s', $itemId, $from->value, $to->value));
+        }
+        $this->audit->record('item.status_changed', 'item', $itemId, $from->value, $to->value, $context, 'admin', $adminId);
+
+        return ['changed' => true, 'status' => $to->value];
     }
 
     // =============================================================================================
@@ -240,7 +298,12 @@ final class AdminController extends RestController
     /**
      * Синхронизация длится минуты, поэтому HTTP-запрос её только ставит в очередь (202 Accepted).
      * Защита от параллельных прогонов — в SyncService (GET_LOCK + uq_sync_runs_one_running); здесь —
-     * быстрый ответ «уже идёт» и unique-задача Action Scheduler.
+     * быстрый ответ «уже идёт / уже в очереди».
+     *
+     * Флаг unique у as_enqueue_async_action не используется: в Action Scheduler 3.x уникальность — hook + group
+     * БЕЗ args (проверено по 3.9.0), и ожидающая ежедневная recurring-задача того же hook-а блокировала бы
+     * ручной запуск навсегда. Вместо него — as_has_scheduled_action() с args; редкий двойной клик двух
+     * администраторов даст две задачи, вторая получит от SyncService «locked/busy» и ничего не сделает.
      */
     public function runSync(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
     {
@@ -249,6 +312,16 @@ final class AdminController extends RestController
             $adminId = $this->currentUserId();
             $source = (string) $request->get_param('source');
 
+            $known = self::registeredSources();
+            if (!\in_array($source, $known, true)) {
+                throw new DomainError(
+                    'uniundata_invalid_param',
+                    \__('Unknown sync source.', 'uniundata-books'),
+                    400,
+                    ['param' => 'source', 'known_sources' => $known],
+                );
+            }
+
             $running = $this->db->getRow(
                 "SELECT id, source_name, triggered_by, status, started_at, heartbeat_at,
                         TIMESTAMPDIFF(SECOND, heartbeat_at, UTC_TIMESTAMP(6)) AS heartbeat_age
@@ -256,21 +329,32 @@ final class AdminController extends RestController
                   WHERE running_source = %s",
                 $source,
             );
-            if ($running !== null && (int) $running['heartbeat_age'] < self::STALE_HEARTBEAT_SECONDS) {
+            // Порог «завис» — тот же, что у SyncService: иначе админ поставил бы задачу, а SyncService ответил бы busy.
+            if ($running !== null && (int) $running['heartbeat_age'] < SyncService::STALE_AFTER_SECONDS) {
                 return new \WP_REST_Response([
                     'queued' => false,
                     'reason' => 'already_running',
+                    'action_id' => null,
                     'running_run' => self::presentRun($running),
                 ], 202);
             }
 
-            if (!\function_exists('as_enqueue_async_action')) {
+            if (!\function_exists('as_enqueue_async_action') || !\function_exists('as_has_scheduled_action')) {
                 throw new \RuntimeException('Action Scheduler is not loaded');
             }
-            // unique=true: пока такая задача ждёт или выполняется, вторая не ставится (возвращается 0).
-            $actionId = (int) as_enqueue_async_action(self::HOOK_SYNC, ['admin', $source], self::AS_GROUP, true);
+            $args = ['admin', $source];
+            if (as_has_scheduled_action(self::HOOK_SYNC, $args, self::AS_GROUP)) {
+                return new \WP_REST_Response([
+                    'queued' => false,
+                    'reason' => 'already_queued',
+                    'action_id' => null,
+                    'running_run' => $running !== null ? self::presentRun($running) : null,
+                ], 202);
+            }
+            $actionId = (int) as_enqueue_async_action(self::HOOK_SYNC, $args, self::AS_GROUP);
 
-            $this->audit->record('sync.requested', 'sync_run', $running !== null ? (int) $running['id'] : 0, null, null, [
+            // Прогона ещё нет: entity_id = NULL (wp_book_audit_log.entity_id NULL-able).
+            $this->audit->record('sync.requested', 'sync_run', $running !== null ? (int) $running['id'] : null, null, null, [
                 'source' => $source,
                 'action_id' => $actionId,
                 'stale_running' => $running !== null,
@@ -278,11 +362,29 @@ final class AdminController extends RestController
 
             return new \WP_REST_Response([
                 'queued' => $actionId > 0,
-                'reason' => $actionId > 0 ? ($running !== null ? 'stale_running_replaced' : null) : 'already_queued',
+                'reason' => $running !== null ? 'stale_running_replaced' : null,
                 'action_id' => $actionId > 0 ? $actionId : null,
                 'running_run' => $running !== null ? self::presentRun($running) : null,
             ], 202);
         });
+    }
+
+    /**
+     * Имена источников, как их видит SyncService в Plugin.php (фильтр uniundata_sync_sources). Читается только
+     * на этом маршруте: SyncService на каждом REST-запросе не создаётся.
+     *
+     * @return list<string>
+     */
+    private static function registeredSources(): array
+    {
+        $names = [];
+        foreach ((array) apply_filters('uniundata_sync_sources', []) as $client) {
+            if ($client instanceof SourceClientInterface) {
+                $names[] = $client->name();
+            }
+        }
+
+        return array_values(array_unique($names));
     }
 
     public function listSyncRuns(\WP_REST_Request $request): \WP_REST_Response|\WP_Error

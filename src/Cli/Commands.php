@@ -22,7 +22,8 @@ use Uniundata\Books\Sync\SyncService;
  *   wp uniundata sync status [--source=<name>] [--limit=<n>] [--format=<format>]
  *   wp uniundata sync reextract --source=<name>
  *   wp uniundata expire [--limit=<n>]
- *   wp uniundata migrate
+ *   wp uniundata privacy-retention [--batch=<n>]
+ *   wp uniundata migrate [--rebuild-fulltext]
  *   wp uniundata doctor [--format=<format>]
  */
 final class Commands
@@ -108,7 +109,7 @@ final class Commands
             $rows = $sync->recentRuns($source, (int) ($assoc['limit'] ?? 10));
             \WP_CLI\Utils\format_items($assoc['format'] ?? 'table', $rows, [
                 'id', 'source_name', 'triggered_by', 'status', 'started_at', 'finished_at', 'heartbeat_at', 'is_stale',
-                'records_received', 'records_created', 'records_updated', 'records_skipped',
+                'resumed_from_run_id', 'pass_started_run_id', 'records_received', 'records_created', 'records_updated', 'records_skipped',
                 'items_created', 'items_updated', 'items_skipped', 'items_conflicts', 'items_missing', 'items_withdrawn',
                 'errors_count',
             ]);
@@ -160,6 +161,7 @@ final class Commands
             match ($result['status']) {
                 'succeeded' => \WP_CLI::success($line),
                 'partial', 'locked', 'busy' => \WP_CLI::warning($line),
+                'misconfigured' => \WP_CLI::error($line),
                 default => (function () use ($line, &$failed): void {
                     $failed = true;
                     \WP_CLI::warning($line);
@@ -220,7 +222,53 @@ final class Commands
     }
 
     /**
+     * Обезличить персональные данные по срокам хранения (то же, что ежедневная задача uniundata_privacy_retention).
+     *
+     * ## OPTIONS
+     *
+     * [--batch=<n>]
+     * : Размер пакета каждого шага. Повторяется, пока есть что обрабатывать.
+     * ---
+     * default: 500
+     * ---
+     *
+     * ## EXAMPLES
+     *
+     *     $ wp uniundata privacy-retention
+     *
+     * @subcommand privacy-retention
+     * @param list<string>          $args
+     * @param array<string, string> $assoc
+     */
+    public function privacyRetention(array $args, array $assoc): void
+    {
+        $batch = max(1, (int) ($assoc['batch'] ?? 500));
+        $total = ['consents' => 0, 'contacts' => 0, 'names' => 0];
+        do {
+            $r = $this->plugin->privacyRetention($batch);
+            foreach ($r as $k => $n) {
+                $total[$k] += $n;
+            }
+        } while (max($r) >= $batch);
+        \WP_CLI::success(\sprintf(
+            'Consents minimized: %d, order contacts erased: %d, order names anonymized: %d.',
+            $total['consents'],
+            $total['contacts'],
+            $total['names'],
+        ));
+    }
+
+    /**
      * Применить миграции схемы и привести роли к версии кода. Шаг деплоя.
+     *
+     * Проверяет MySQL ≥ 8.0.16 и права пользователя БД (нужен REFERENCES), сверяет существующие таблицы
+     * со схемой (их могли создать вручную) и печатает предупреждения окружения (time_zone и т. п.).
+     *
+     * ## OPTIONS
+     *
+     * [--rebuild-fulltext]
+     * : Перестроить FULLTEXT-индексы без стоп-слов (после смены innodb_ft_min_token_size или ручного импорта).
+     * На время перестройки поиск по каталогу недоступен.
      *
      * ## EXAMPLES
      *
@@ -231,19 +279,30 @@ final class Commands
      */
     public function migrate(array $args, array $assoc): void
     {
+        $migrator = $this->plugin->get(Migrator::class);
         try {
-            $r = $this->plugin->get(Migrator::class)->migrate(30);
+            $r = $migrator->migrate(30, (bool) \WP_CLI\Utils\get_flag_value($assoc, 'rebuild-fulltext', false));
         } catch (\RuntimeException $e) {
             \WP_CLI::error($e->getMessage());
         }
         Roles::install();
+        foreach ($migrator->environmentWarnings() as $warning) {
+            \WP_CLI::warning($warning);
+        }
+        foreach ($this->plugin->configProblems() as $problem) {
+            \WP_CLI::warning($problem);
+        }
+        if ($r['rebuilt'] !== []) {
+            \WP_CLI::log('FULLTEXT rebuilt: ' . implode(', ', $r['rebuilt']));
+        }
         \WP_CLI::success($r['applied'] === []
-            ? \sprintf('Schema is up to date (version %d).', $r['to'])
+            ? \sprintf('Schema is up to date (version %d). Roles v%d.', $r['to'], Roles::VERSION)
             : \sprintf('Migrated schema %d → %d (applied: %s). Roles v%d.', $r['from'], $r['to'], implode(', ', $r['applied']), Roles::VERSION));
     }
 
     /**
-     * Проверка инвариантов данных (должно быть 0 нарушений). Код выхода 1 при нарушениях — для мониторинга.
+     * Проверка схемы, настроек и инвариантов данных (должно быть 0 нарушений). Код выхода 1 при нарушениях —
+     * для мониторинга.
      *
      * ## OPTIONS
      *
@@ -266,8 +325,21 @@ final class Commands
     public function doctor(array $args, array $assoc): void
     {
         $db = $this->plugin->get(Db::class);
+        $migrator = $this->plugin->get(Migrator::class);
+        $problems = $migrator->verifySchema();
+        foreach ($problems as $problem) {
+            \WP_CLI::warning('schema: ' . $problem);
+        }
+        foreach (array_merge($migrator->environmentWarnings(), $this->plugin->configProblems()) as $warning) {
+            \WP_CLI::warning($warning);
+        }
+        if ($problems !== []) {
+            \WP_CLI::halt(1); // без таблиц проверять инварианты нечем
+        }
+
         $t = static fn (string $name): string => $db->table($name);
         $openOrders = "'draft', 'pending_payment', 'payment_processing', 'payment_failed'";
+        $stale = SyncService::STALE_AFTER_SECONDS;
 
         // Те же запросы, что в sql/queries.sql, раздел «Инварианты».
         $checks = [
@@ -287,7 +359,7 @@ final class Commands
                 "SELECT i.id FROM {$t('items')} i
                   WHERE i.availability_status = 'checkout_pending'
                     AND NOT EXISTS (SELECT 1 FROM {$t('order_items')} oi JOIN {$t('orders')} o ON o.id = oi.order_id
-                                     WHERE oi.book_item_id = i.id AND o.status IN ({$openOrders}))",
+                                     WHERE oi.book_item_id = i.id AND (o.status IN ({$openOrders}) OR o.needs_attention = 1))",
             'sold_without_sale' =>
                 "SELECT i.id FROM {$t('items')} i
                    LEFT JOIN {$t('sales')} s ON s.book_item_id = i.id
@@ -301,15 +373,23 @@ final class Commands
                    JOIN {$t('order_items')} oi ON oi.order_id = o.id
                    LEFT JOIN {$t('sales')} s ON s.order_item_id = oi.id
                   WHERE o.status IN ('paid', 'fulfilled', 'completed') AND o.needs_attention = 0 AND s.id IS NULL",
+            'payment_refunded_amount_mismatch' =>
+                "SELECT p.id FROM {$t('payments')} p
+                  WHERE p.refunded_amount <> (SELECT COALESCE(SUM(rf.amount), 0) FROM {$t('refunds')} rf
+                                               WHERE rf.payment_id = p.id AND rf.status = 'succeeded')",
             'reservation_overdue_10min' =>
                 "SELECT id FROM {$t('reservations')}
                   WHERE reservation_status = 'active' AND expires_at < UTC_TIMESTAMP(6) - INTERVAL 10 MINUTE",
             'order_overdue_10min' =>
                 "SELECT id FROM {$t('orders')}
-                  WHERE status IN ({$openOrders}) AND payment_due_at < UTC_TIMESTAMP(6) - INTERVAL 10 MINUTE",
+                  WHERE status IN ({$openOrders}) AND needs_attention = 0
+                    AND payment_due_at < UTC_TIMESTAMP(6) - INTERVAL 10 MINUTE",
+            'refund_stuck_1day' =>
+                "SELECT id FROM {$t('refunds')}
+                  WHERE status IN ('requested', 'pending') AND requested_at < UTC_TIMESTAMP(6) - INTERVAL 1 DAY",
             'sync_run_stale' =>
                 "SELECT id FROM {$t('sync_runs')}
-                  WHERE status = 'running' AND heartbeat_at < UTC_TIMESTAMP(6) - INTERVAL 15 MINUTE",
+                  WHERE status = 'running' AND heartbeat_at < UTC_TIMESTAMP(6) - INTERVAL {$stale} SECOND",
             'orders_need_attention' =>
                 "SELECT id FROM {$t('orders')} WHERE needs_attention = 1",
         ];

@@ -21,6 +21,8 @@ use Uniundata\Books\Domain\PaymentStatus;
  * Сопоставление с нашим платежом: providerPaymentId → (provider, provider_payment_id); если банк
  * прислал событие раньше, чем мы сохранили provider_payment_id (ответ createSession ещё в пути), —
  * по idempotencyKey (наш payments.idempotency_key, который банк возвращает как merchant reference).
+ * Событие возврата (refunded / partially_refunded) сопоставляется со строкой wp_book_refunds по
+ * providerRefundId / refundIdempotencyKey, а если их нет — по приросту refundedAmount.
  */
 final readonly class ProviderPaymentResult
 {
@@ -56,6 +58,10 @@ final readonly class ProviderPaymentResult
         /** Unix-время из ПОДПИСАННОГО заголовка/тела события — для защиты от replay. */
         public ?int $signedAt = null,
         public array $redactedPayload = [],
+        /** Событие возврата: ID возврата у банка (сопоставляется с wp_book_refunds.provider_refund_id). */
+        public ?string $providerRefundId = null,
+        /** Событие возврата: наш wp_book_refunds.idempotency_key, если банк его возвращает. */
+        public ?string $refundIdempotencyKey = null,
     ) {
         if (!preg_match('/^[a-z0-9_]{1,32}$/', $provider)) {
             throw new \InvalidArgumentException('provider must match [a-z0-9_]{1,32}');
@@ -68,9 +74,11 @@ final readonly class ProviderPaymentResult
         self::assertAscii('eventId', $eventId, 128);
         self::assertAscii('eventType', $eventType, 64);
         self::assertAscii('failureCode', $failureCode, 64);
-        if ($idempotencyKey !== null
-            && !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $idempotencyKey)) {
-            throw new \InvalidArgumentException('idempotencyKey must be a lowercase UUID');
+        self::assertAscii('providerRefundId', $providerRefundId, 128);
+        foreach (['idempotencyKey' => $idempotencyKey, 'refundIdempotencyKey' => $refundIdempotencyKey] as $name => $key) {
+            if ($key !== null && !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $key)) {
+                throw new \InvalidArgumentException($name . ' must be a lowercase UUID');
+            }
         }
         if ($publicOrderId !== null && !preg_match('/^uniundata_[0-9a-f-]{36}$/', $publicOrderId)) {
             throw new \InvalidArgumentException('publicOrderId has invalid format');
@@ -122,6 +130,8 @@ final readonly class ProviderPaymentResult
             eventType: $event->eventType,
             signedAt: $event->signedAt,
             redactedPayload: $event->redactedPayload,
+            providerRefundId: $this->providerRefundId ?? $event->providerRefundId,
+            refundIdempotencyKey: $this->refundIdempotencyKey ?? $event->refundIdempotencyKey,
         );
     }
 
@@ -135,7 +145,7 @@ final readonly class ProviderPaymentResult
         if ($value === null && $nullable) {
             return;
         }
-        // Колонки ascii: в нестрогом sql_mode WordPress не-ASCII превратился бы в '?' молча.
+        // Идентификаторы банка хранятся в utf8mb4_bin-колонках и сравниваются побайтно: только печатный ASCII.
         if ($value === null || !preg_match('/^[\x21-\x7E]{1,' . $maxLen . '}$/', $value)) {
             throw new \InvalidArgumentException($name . ' must be 1..' . $maxLen . ' printable ASCII chars');
         }

@@ -9,7 +9,8 @@ namespace Uniundata\Books\Infrastructure;
  *
  * Вызывается ВНУТРИ той же Db::transaction(), что и само изменение: запись аудита фиксируется
  * или откатывается вместе с ним, поэтому журнал не врёт о несостоявшихся переходах.
- * Ошибка записи аудита откатывает бизнес-операцию — это осознанно.
+ * Ошибка записи аудита откатывает бизнес-операцию — это осознанно. Событие без бизнес-транзакции
+ * (отклонённый webhook) можно записать и вне её: Db::insert() сам откроет короткую транзакцию.
  *
  * В context не кладём секреты, PAN/CVV и лишние PII (email, адрес, телефон): только ID и коды.
  * Ключи, похожие на секреты, дополнительно маскируются.
@@ -37,13 +38,15 @@ final class AuditLog
     /**
      * @param string               $action      'reservation.created', 'item.status_changed', 'order.paid'…
      * @param string               $entityType  'reservation', 'item', 'cart', 'order', 'payment'…
+     * @param int|null             $entityId    null — у события нет сущности (отклонённый webhook, запрос
+     *                                          синхронизации до создания прогона); 0 тоже пишется как NULL.
      * @param array<string, mixed> $context
      * @param string               $actorType   user|admin|system|cron|webhook|sync|cli
      */
     public function record(
         string $action,
         string $entityType,
-        int $entityId,
+        ?int $entityId,
         ?string $from,
         ?string $to,
         array $context = [],
@@ -52,6 +55,9 @@ final class AuditLog
     ): void {
         if (!\in_array($actorType, self::ACTOR_TYPES, true)) {
             throw new \InvalidArgumentException(\sprintf('Unknown audit actor type "%s"', $actorType));
+        }
+        if ($entityId !== null && $entityId < 0) {
+            throw new \InvalidArgumentException(\sprintf('Invalid audit entity id %d', $entityId));
         }
         self::assertCode($action, 64, 'action');
         self::assertCode($entityType, 32, 'entity type');
@@ -67,7 +73,7 @@ final class AuditLog
             'actor_user_id' => $actorUserId !== null && $actorUserId > 0 ? $actorUserId : null,
             'action' => $action,
             'entity_type' => $entityType,
-            'entity_id' => $entityId,
+            'entity_id' => $entityId !== null && $entityId > 0 ? $entityId : null,
             'from_status' => $from,
             'to_status' => $to,
             'request_id' => $this->requestId,
@@ -84,7 +90,8 @@ final class AuditLog
     private static function encodeContext(array $context): string
     {
         try {
-            // Без JSON_UNESCAPED_UNICODE: запрос остаётся ASCII и не проходит дорогую проверку кодировок $wpdb.
+            // Без JSON_UNESCAPED_UNICODE: запрос остаётся ASCII, и $wpdb пропускает для этого INSERT
+            // проверку кодировок (check_safe_collation / strip_invalid_text_from_query).
             $json = json_encode(
                 self::redact($context, 0),
                 JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR,

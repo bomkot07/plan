@@ -18,8 +18,8 @@ namespace Uniundata\Books\Sync;
  *     'marc_format'      => 'marcxml',             // marcxml | marc_json | iso2709 | mrk
  *     'marc'             => '<record>…</record>',  // ≤ 1 МБ
  *     'status'           => 'present',             // present | withdrawn («снят» источником)
- *     'price_amount'     => 4500,                  // int, центы; float/«45.00» не принимаются
- *     'currency'         => 'EUR',
+ *     'price_amount'     => 450000,                // int > 0, минимальные единицы (копейки); float/«4500.00» не принимаются
+ *     'currency'         => 'RUB',                 // ISO 4217; не равна валюте магазина — экземпляр пропускается
  *     'condition_code'   => 'very_good',           // new | as_new | fine | very_good | good | fair | poor
  *     'condition_note'   => 'Корешок подклеен',    // необязательно
  *     'inventory_number' => 'INV-77',              // необязательно; UNIQUE в магазине
@@ -34,7 +34,8 @@ namespace Uniundata\Books\Sync;
  */
 final class SourceBatch
 {
-    public const MAX_CURSOR_LENGTH = 200;
+    /** wp_book_sync_runs.source_cursor — VARCHAR(1024). */
+    public const MAX_CURSOR_LENGTH = 1024;
 
     private const FORMATS = ['marcxml', 'marc_json', 'iso2709', 'mrk'];
     private const CONDITIONS = ['new', 'as_new', 'fine', 'very_good', 'good', 'fair', 'poor'];
@@ -53,8 +54,8 @@ final class SourceBatch
      * @param list<array<string, mixed>> $rawEntries
      * @param string|null $nextCursor  Курсор следующей страницы; null допустим только при $isLast.
      * @param bool        $isLast      Последняя страница прохода.
-     * @param bool        $fullSnapshot Проход отдаёт ВЕСЬ каталог источника (а не только изменения).
-     *                                 Только для полного прохода выполняется пометка пропавших.
+     * @param bool        $fullSnapshot Проход отдаёт ВЕСЬ каталог источника (а не только изменения); одинаков
+     *                                 у всех страниц прохода. Только после полного прохода помечаются пропавшие.
      * @param int|null    $totalCount  Сколько записей в проходе всего, если источник знает (для прогресса).
      */
     public function __construct(
@@ -66,7 +67,7 @@ final class SourceBatch
     ) {
         if ($nextCursor !== null
             && (\strlen($nextCursor) > self::MAX_CURSOR_LENGTH || preg_match('/^[\x20-\x7E]+$/', $nextCursor) !== 1)) {
-            throw new \UnexpectedValueException('Source cursor must be printable ASCII, at most 200 characters');
+            throw new \UnexpectedValueException('Source cursor must be printable ASCII, 1..1024 characters');
         }
         if (!$isLast && $nextCursor === null) {
             throw new \UnexpectedValueException('Source returned no cursor for a non-final page');
@@ -125,8 +126,9 @@ final class SourceBatch
         if (\is_string($price) && preg_match('/^\d{1,10}$/', $price) === 1) {
             $price = (int) $price;
         }
-        if (!\is_int($price) || $price < 0 || $price > self::MAX_PRICE) {
-            throw new \UnexpectedValueException('price_amount must be a non-negative integer in minor units');
+        if (!\is_int($price) || $price < 1 || $price > self::MAX_PRICE) {
+            // CHECK wp_book_items_chk_price: price_amount > 0 — бесплатных/без цены экземпляров в продаже нет.
+            throw new \UnexpectedValueException('price_amount must be a positive integer in minor units');
         }
 
         $currency = \is_string($e['currency'] ?? null) ? strtoupper($e['currency']) : '';

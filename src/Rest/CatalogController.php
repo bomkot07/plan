@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Uniundata\Books\Rest;
 
+use Uniundata\Books\Domain\ItemStatus;
 use Uniundata\Books\Infrastructure\AuditLog;
 use Uniundata\Books\Infrastructure\Db;
 use Uniundata\Books\Service\ReservationService;
@@ -82,15 +83,19 @@ final class CatalogController extends RestController
             $mine = $userId > 0 ? $this->loadMyReservations($userId, $ids) : [];
             $pendingIds = array_keys(array_filter($items, static fn (array $i): bool => $i['availability_status'] === 'checkout_pending'));
             $myOrders = $userId > 0 && $pendingIds !== [] ? $this->loadMyOrderHolds($userId, $pendingIds) : [];
+            // Сколько ещё книг пользователь может отложить одновременно (как ReservationService::reserve()).
+            $activeLeft = $canReserveCap ? max(0, self::maxActiveReservations() - $this->countMyActiveReservations($userId)) : null;
+            $ctx = ['user_id' => $userId, 'can_reserve_cap' => $canReserveCap, 'active_left' => $activeLeft, 'shop_currency' => self::shopCurrency()];
 
             $out = [];
             foreach ($ids as $id) {
-                $out[] = $this->present($id, $items[$id] ?? null, $mine[$id] ?? null, $myOrders[$id] ?? null, $userId, $canReserveCap);
+                $out[] = $this->present($id, $items[$id] ?? null, $mine[$id] ?? null, $myOrders[$id] ?? null, $ctx);
             }
 
             return [
                 'server_time' => Db::toIso8601($this->db->now()),
                 'authenticated' => $userId > 0,
+                'active_reservations_left' => $activeLeft,
                 'items' => $out,
             ];
         });
@@ -99,10 +104,12 @@ final class CatalogController extends RestController
     /**
      * @param ?array<string, mixed> $item
      * @param ?array<string, mixed> $mine
+     * @param array{user_id: int, can_reserve_cap: bool, active_left: ?int, shop_currency: ?string} $ctx
      * @return array<string, mixed>
      */
-    private function present(int $id, ?array $item, ?array $mine, ?string $myOrder, int $userId, bool $canReserveCap): array
+    private function present(int $id, ?array $item, ?array $mine, ?string $myOrder, array $ctx): array
     {
+        $userId = $ctx['user_id'];
         $attemptsUsed = $mine !== null ? (int) $mine['attempts_used'] : 0;
         $row = [
             'book_item_id' => $id,
@@ -125,12 +132,11 @@ final class CatalogController extends RestController
         $status = (string) $item['availability_status'];
 
         // Публичный статус: внутренние reserved/checkout_pending не различаем, служебные — «недоступна».
+        // Цена не в валюте магазина (option uniundata_currency) — такой экземпляр не резервируется (409 reason=currency).
         $row['status'] = match (true) {
             !$item['is_active'] => 'unavailable',
-            $status === 'available' => 'available',
-            $status === 'reserved', $status === 'checkout_pending' => 'reserved',
-            $status === 'sold' => 'sold',
-            default => 'unavailable', // withdrawn, sync_missing, blocked
+            $status === 'available' && $ctx['shop_currency'] !== null && $item['currency'] !== $ctx['shop_currency'] => 'unavailable',
+            default => ItemStatus::from($status)->publicState(),
         };
 
         if ($status === 'reserved' && $mine !== null && $mine['active_expires_at'] !== null) {
@@ -158,13 +164,18 @@ final class CatalogController extends RestController
 
             return $row;
         }
-        if (!$canReserveCap) {
+        if (!$ctx['can_reserve_cap']) {
             $row['reason'] = 'forbidden';
 
             return $row;
         }
         if ($attemptsUsed >= ReservationService::MAX_ATTEMPTS) {
             $row['reason'] = 'limit_reached';
+
+            return $row;
+        }
+        if ($ctx['active_left'] === 0) {
+            $row['reason'] = 'active_limit_reached';
 
             return $row;
         }
@@ -259,5 +270,31 @@ final class CatalogController extends RestController
         }
 
         return $out;
+    }
+
+    /** Активные (не истёкшие) резервы пользователя — ix_reservations_user (user_id, reservation_status, expires_at). */
+    private function countMyActiveReservations(int $userId): int
+    {
+        return (int) $this->db->getVar(
+            "SELECT COUNT(*) FROM {$this->db->table('book_reservations')}
+              WHERE user_id = %d AND reservation_status = 'active' AND expires_at > UTC_TIMESTAMP(6)",
+            $userId,
+        );
+    }
+
+    /** = ReservationService::maxActiveReservations(): мусор или значение < 1 в опции — значение по умолчанию. */
+    private static function maxActiveReservations(): int
+    {
+        $value = (int) get_option('uniundata_max_active_reservations', ReservationService::DEFAULT_MAX_ACTIVE_RESERVATIONS);
+
+        return $value >= 1 ? $value : ReservationService::DEFAULT_MAX_ACTIVE_RESERVATIONS;
+    }
+
+    /** Валюта магазина; не настроена — null (подсказка не проверяет валюту, reserve ответит ошибкой конфигурации). */
+    private static function shopCurrency(): ?string
+    {
+        $currency = get_option('uniundata_currency');
+
+        return \is_string($currency) && preg_match('/^[A-Z]{3}$/', $currency) === 1 ? $currency : null;
     }
 }

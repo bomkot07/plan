@@ -16,18 +16,29 @@ use Uniundata\Books\Service\CheckoutService;
  * нажатие кнопки и повторяет при ретраях) → orders.checkout_request_id, UNIQUE(user_id, checkout_request_id):
  * повтор того же ключа возвращает тот же заказ (200, replayed=true), а не создаёт второй.
  *
- * Валидация в два слоя: args (тип, диапазон, pattern, белый список полей адреса) отсекают мусор до
- * permission/callback; CheckoutRequest проверяет то же независимо от транспорта (CLI, тесты).
+ * Данные покупателя: `customer` {first_name, last_name, middle_name?, phone?}; незаполненное берётся из
+ * профиля (usermeta first_name/last_name/middle_name, wp_book_customer_profiles.phone_e164), e-mail — только
+ * из профиля. Отчество не обязательно.
+ *
+ * Валидация в два слоя: args (тип, диапазон, белый список полей) отсекают мусор до permission/callback;
+ * CheckoutRequest проверяет то же независимо от транспорта (CLI, тесты) и нормализует телефон в E.164.
  * Ответы:
  *   201 — заказ создан, payment.redirect_url — страница банка;
  *   200 — повтор Idempotency-Key, тот же заказ;
- *   409 uniundata_cart_changed — истёкшие позиции помечены, клиент показывает новую корзину и подтверждает
- *       заново (с НОВЫМ Idempotency-Key и новой expected_total_amount);
+ *   409 uniundata_cart_empty / uniundata_cart_changed — клиент обрабатывает ОДИНАКОВО: перезагружает корзину
+ *       (GET /cart), показывает её и подтверждает заново с НОВЫМ Idempotency-Key и новой expected_total_amount;
+ *   409 uniundata_terms_outdated — data.current_versions: показать новые тексты оферты/политики;
  *   502 uniundata_payment_provider_error — заказ создан (data.public_order_id), банк недоступен:
  *       клиент повторяет оплату через POST /orders/{id}/pay.
  */
 final class CheckoutController extends RestController
 {
+    /** Телефон до нормализации: «+7 (846) 123-45-67»; E.164 проверяет CheckoutRequest. */
+    private const PHONE_SCHEMA = ['type' => 'string', 'pattern' => '^\\+?[0-9 ()\\-.]{7,24}$', 'maxLength' => 24];
+
+    /** Имя: длина = customer_*_name VARCHAR(100); символы проверяет CheckoutRequest, пустая строка — «из профиля». */
+    private const NAME_SCHEMA = ['type' => 'string', 'maxLength' => 100];
+
     /** Поля адреса и их максимальная длина — те же, что в CheckoutRequest::ADDRESS_FIELDS. */
     private const ADDRESS_SCHEMA = [
         'type' => 'object',
@@ -60,16 +71,16 @@ final class CheckoutController extends RestController
             'permission_callback' => $this->requireCapability('create_book_orders'),
             'args' => [
                 'expected_total_amount' => [
-                    'description' => 'Сумма к оплате, которую видел покупатель, в центах. Расхождение с сервером → 409 uniundata_cart_changed.',
+                    'description' => 'Сумма к оплате, которую видел покупатель, в минимальных единицах валюты (копейки). Расхождение с сервером → 409 uniundata_cart_changed.',
                     'type' => 'integer',
-                    'minimum' => 0,
+                    'minimum' => 1,
                     'maximum' => 4294967295,
                     'required' => true,
                     'validate_callback' => 'rest_validate_request_arg',
                     'sanitize_callback' => 'rest_sanitize_request_arg',
                 ],
                 'currency' => [
-                    'description' => 'ISO 4217, например EUR.',
+                    'description' => 'Валюта магазина (option uniundata_currency), ISO 4217.',
                     'type' => 'string',
                     'pattern' => '^[A-Za-z]{3}$',
                     'required' => true,
@@ -90,13 +101,25 @@ final class CheckoutController extends RestController
                     'validate_callback' => 'rest_validate_request_arg',
                     'sanitize_callback' => 'rest_sanitize_request_arg',
                 ],
-                'phone' => [
-                    'description' => 'Телефон в E.164 (+491701234567). Если не передан — из профиля.',
-                    'type' => 'string',
-                    'pattern' => '^\+[1-9][0-9]{6,14}$',
+                'customer' => [
+                    'description' => 'Покупатель для снимка заказа и чека; незаданные поля берутся из профиля.',
+                    'type' => 'object',
+                    'additionalProperties' => false,
+                    'properties' => [
+                        'first_name' => self::NAME_SCHEMA,
+                        'last_name' => self::NAME_SCHEMA,
+                        'middle_name' => self::NAME_SCHEMA,
+                        'phone' => self::PHONE_SCHEMA,
+                    ],
                     'required' => false,
                     'validate_callback' => 'rest_validate_request_arg',
-                    'sanitize_callback' => 'sanitize_text_field',
+                    'sanitize_callback' => 'rest_sanitize_request_arg',
+                ],
+                'phone' => self::PHONE_SCHEMA + [
+                    'description' => 'Устарело: то же, что customer.phone (customer.phone приоритетнее).',
+                    'required' => false,
+                    'validate_callback' => 'rest_validate_request_arg',
+                    'sanitize_callback' => 'rest_sanitize_request_arg',
                 ],
             ],
         ]);

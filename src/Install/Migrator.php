@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Uniundata\Books\Install;
 
+use Uniundata\Books\Infrastructure\Db;
+
 /**
  * Версионные миграции схемы (option `uniundata_db_version`).
  *
@@ -11,20 +13,29 @@ namespace Uniundata\Books\Install;
  * SHOW COLUMNS/SHOW INDEX. Он не понимает generated columns (`GENERATED ALWAYS AS … STORED`, на них держится
  * «уникальность только активных»), CHECK и FOREIGN KEY: на повторном запуске пытается «исправить» такие
  * таблицы лишними ALTER или падает, а переименования и преобразования данных не умеет вовсе. Поэтому —
- * явные миграции, каждая идемпотентна (повтор после частичного сбоя безопасен: DDL в MySQL делает неявный
- * COMMIT, «откатить половину миграции» нельзя).
+ * явные миграции, каждая идемпотентна (DDL в MySQL делает неявный COMMIT, «откатить половину миграции»
+ * нельзя — повтор после частичного сбоя обязан быть безопасным).
  *
- * Миграция 1 выполняет каноническую sql/schema.sql (единственный источник правды о схеме) через
- * $wpdb->query():
- *   - `wp_book_` → `{$wpdb->prefix}book_` (мультисайт: wp_2_book_…);
- *   - CREATE TABLE → CREATE TABLE IF NOT EXISTS, ALTER … ADD CONSTRAINT — только если такого ограничения нет;
- *   - SET NAMES/SET time_zone из файла пропускаются: соединение $wpdb общее с ядром;
- *   - имена CONSTRAINT получают префикс таблиц, если он не `wp_`: в MySQL 8 имена CHECK и FOREIGN KEY
- *     уникальны в пределах СХЕМЫ (БД), а не таблицы. Второй сайт мультисайта (или вторая установка WP
- *     в той же БД) иначе получил бы ошибку 3822 «Duplicate check constraint name» (проверено на 8.0.46).
+ * Миграция 1 выполняет каноническую sql/schema.sql (единственный источник правды о схеме):
+ *   - `wp_book_…` → `{$wpdb->prefix}book_…` одной заменой по границе слова. Имена CHECK/FOREIGN KEY
+ *     начинаются с имени таблицы (wp_book_items_chk_status), поэтому меняются той же заменой: в MySQL 8
+ *     они уникальны в пределах БД, и мультисайт (wp_2_) или второй WordPress в той же БД не конфликтуют;
+ *   - CREATE TABLE → CREATE TABLE IF NOT EXISTS; ALTER … ADD CONSTRAINT — только если ограничения нет;
+ *   - SET из файла не выполняются: сессию задаёт сам мигратор (withDdlSession): SET NAMES utf8mb4 и
+ *     innodb_ft_enable_stopword = OFF — настройка стоп-слов фиксируется в таблице при создании её
+ *     FULLTEXT-индексов (без неё обязательное «+und»/«+the» обнуляет выдачу BOOLEAN MODE);
+ *   - таблицы могли быть созданы заранее вручную (phpMyAdmin, импорт дампа): после выполнения схема
+ *     сверяется с information_schema (колонки, utf8mb4, индексы и их уникальность, generated columns,
+ *     CHECK/FK, InnoDB). Расхождение — исключение со списком, данные не трогаются. FULLTEXT-индексы
+ *     заранее созданной таблицы перестраиваются: узнать, с какими стоп-словами они построены, без
+ *     прав PROCESS/SYSTEM_VARIABLES_ADMIN нельзя.
+ *
+ * Перед DDL — проверка окружения: MySQL ≥ 8.0.16 (CHECK), не MariaDB, InnoDB, utf8mb4_unicode_520_ci и
+ * права пользователя БД (SHOW GRANTS): без REFERENCES MySQL отвергает FOREIGN KEY (ошибка 1142).
  *
  * Запуск: register_activation_hook и plugins_loaded при отставании версии (Plugin). Одновременные запросы
- * после деплоя сериализуются GET_LOCK; основной путь в продакшене — шаг деплоя `wp uniundata migrate`.
+ * сериализуются GET_LOCK(Db::lockName('migrate')); основной путь в продакшене — шаг деплоя
+ * `wp uniundata migrate`.
  *
  * Будущие миграции — expand → migrate → contract: m002 добавляет nullable-колонку
  * (`ALTER TABLE … ADD COLUMN …, ALGORITHM=INSTANT` после проверки columnExists()), данные переносятся
@@ -37,6 +48,12 @@ final class Migrator
     public const VERSION_OPTION = 'uniundata_db_version';
     public const MIN_MYSQL_VERSION = '8.0.16'; // CHECK-ограничения работают с 8.0.16
 
+    /** Права пользователя БД: данные + DDL миграций. REFERENCES — для FOREIGN KEY. */
+    public const REQUIRED_PRIVILEGES = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'INDEX', 'REFERENCES'];
+
+    private const LOCK = 'migrate';
+    private const MAX_IDENTIFIER = 64;
+
     /** @var array<int, string> версия → метод */
     private const MIGRATIONS = [
         1 => 'm001InitialSchema',
@@ -47,11 +64,14 @@ final class Migrator
         'book_records', 'book_contributors', 'book_record_contributors', 'book_subjects', 'book_record_subjects',
         'book_identifiers', 'book_items', 'book_images', 'book_customer_profiles', 'book_user_consents',
         'book_carts', 'book_reservations', 'book_cart_items', 'book_orders', 'book_order_items', 'book_payments',
-        'book_payment_events', 'book_sales', 'book_sync_runs', 'book_audit_log',
+        'book_payment_events', 'book_refunds', 'book_sales', 'book_sync_runs', 'book_audit_log',
     ];
 
+    /** @var array<string, array{columns: array<string, bool>, indexes: array<string, array{type: string, columns: string}>, constraints: list<string>}>|null */
+    private ?array $expected = null;
+
     public function __construct(
-        private readonly \wpdb $wpdb,
+        private readonly Db $db,
         private readonly string $schemaFile,
     ) {
     }
@@ -63,16 +83,17 @@ final class Migrator
     }
 
     /**
-     * @param int $lockTimeoutSeconds Сколько ждать чужую миграцию (активация/WP-CLI — 30 с, веб-запрос — 0–5 с).
-     * @return array{from: int, to: int, applied: list<int>}
-     * @throws \RuntimeException окружение не подходит, блокировка занята или DDL не выполнился.
+     * @param int  $lockTimeoutSeconds Сколько ждать чужую миграцию (активация/WP-CLI — 30 с, веб-запрос — 0–5 с).
+     * @param bool $rebuildFulltext    Перестроить все FULLTEXT-индексы (`wp uniundata migrate --rebuild-fulltext`):
+     *                                 после смены innodb_ft_min_token_size или для таблиц, созданных вручную.
+     * @return array{from: int, to: int, applied: list<int>, rebuilt: list<string>}
+     * @throws \RuntimeException окружение не подходит, блокировка занята, DDL не выполнился или схема расходится.
      */
-    public function migrate(int $lockTimeoutSeconds = 30): array
+    public function migrate(int $lockTimeoutSeconds = 30, bool $rebuildFulltext = false): array
     {
         $this->assertEnvironment();
 
-        $lock = 'uniundata_migrate@' . substr(md5((string) $this->wpdb->dbname . '|' . $this->wpdb->prefix), 0, 8);
-        if ((string) $this->wpdb->get_var($this->wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock, $lockTimeoutSeconds)) !== '1') {
+        if (!$this->db->getLock(self::LOCK, max(0, $lockTimeoutSeconds))) {
             throw new \RuntimeException('Another process is migrating the Uniundata Books schema; try again later');
         }
 
@@ -80,73 +101,239 @@ final class Migrator
             // Версию читаем из БД в обход кэша: пока мы ждали блокировку, миграцию мог выполнить другой процесс.
             $from = $this->storedVersion();
             $applied = [];
+            $rebuilt = [];
             foreach (self::MIGRATIONS as $version => $method) {
                 if ($version <= $from) {
                     continue;
                 }
-                $this->{$method}();
+                $rebuilt = array_merge($rebuilt, $this->{$method}());
                 // Версия — после КАЖДОЙ миграции: сбой в m003 не заставит повторять m002.
                 update_option(self::VERSION_OPTION, $version, true);
                 $applied[] = $version;
             }
-            $this->assertTables();
+            if ($rebuildFulltext) {
+                foreach (array_keys($this->fulltextIndexes()) as $table) {
+                    if (!\in_array($table, $rebuilt, true)) {
+                        $this->rebuildFulltext($table);
+                        $rebuilt[] = $table;
+                    }
+                }
+            }
+            $this->assertSchema();
 
-            return ['from' => $from, 'to' => max($from, self::VERSION), 'applied' => $applied];
+            return ['from' => $from, 'to' => max($from, self::VERSION), 'applied' => $applied, 'rebuilt' => $rebuilt];
         } finally {
-            $this->wpdb->query($this->wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock));
+            $this->db->releaseLock(self::LOCK);
         }
     }
 
+    public function storedVersion(): int
+    {
+        $wpdb = $this->db->wpdb();
+        $value = $this->db->getVar("SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", self::VERSION_OPTION);
+
+        return $value === null ? 0 : (int) $value;
+    }
+
+    // =============================================================================================
+    // Окружение
+    // =============================================================================================
+
     /**
-     * MySQL ≥ 8.0.16 (CHECK), не MariaDB (другая семантика generated columns/CHECK/`FOR UPDATE OF`),
-     * InnoDB доступен (без NO_ENGINE_SUBSTITUTION MySQL молча создал бы MyISAM — без транзакций и FK).
+     * MySQL ≥ 8.0.16 (CHECK), не MariaDB (другая семантика generated columns/CHECK), InnoDB доступен
+     * (без NO_ENGINE_SUBSTITUTION MySQL молча создал бы MyISAM — без транзакций и FK), utf8mb4_unicode_520_ci,
+     * права на DDL и REFERENCES.
      */
     public function assertEnvironment(): void
     {
-        $version = (string) $this->wpdb->get_var('SELECT VERSION()');
+        $version = (string) $this->db->getVar('SELECT VERSION()');
         if (stripos($version, 'mariadb') !== false) {
             throw new \RuntimeException(\sprintf('Uniundata Books requires MySQL %s+, MariaDB is not supported (%s)', self::MIN_MYSQL_VERSION, $version));
         }
         if (preg_match('/^(\d+\.\d+\.\d+)/', $version, $m) !== 1 || version_compare($m[1], self::MIN_MYSQL_VERSION, '<')) {
             throw new \RuntimeException(\sprintf('Uniundata Books requires MySQL %s+ (found %s)', self::MIN_MYSQL_VERSION, $version !== '' ? $version : 'unknown'));
         }
-        $innodb = (string) $this->wpdb->get_var("SELECT SUPPORT FROM information_schema.ENGINES WHERE ENGINE = 'InnoDB'");
+        $innodb = (string) $this->db->getVar("SELECT SUPPORT FROM information_schema.ENGINES WHERE ENGINE = 'InnoDB'");
         if (!\in_array(strtoupper($innodb), ['YES', 'DEFAULT'], true)) {
             throw new \RuntimeException('Uniundata Books requires the InnoDB storage engine');
         }
-        if (method_exists($this->wpdb, 'has_cap') && !$this->wpdb->has_cap('utf8mb4_520')) {
+        if ($this->db->getVar("SELECT COUNT(*) FROM information_schema.COLLATIONS WHERE COLLATION_NAME = 'utf8mb4_unicode_520_ci'") !== '1') {
             throw new \RuntimeException('Uniundata Books requires utf8mb4 with utf8mb4_unicode_520_ci collation');
+        }
+        $grants = $this->missingPrivileges();
+        if ($grants['certain'] && $grants['missing'] !== []) {
+            throw new \RuntimeException(\sprintf(
+                'The database user lacks privileges %s on `%s`. Ask the hosting provider: GRANT %s ON `%s`.* TO <wp user>; (REFERENCES is required for FOREIGN KEY)',
+                implode(', ', $grants['missing']),
+                $this->databaseName(),
+                implode(', ', $grants['missing']),
+                $this->databaseName(),
+            ));
         }
     }
 
-    public function storedVersion(): int
+    /**
+     * Какие из REQUIRED_PRIVILEGES не выданы пользователю БД на текущую базу (по SHOW GRANTS: прямые права
+     * и права активных ролей). certain = false, если вывод нельзя оценить однозначно (права на отдельные
+     * таблицы, нестандартный формат) — тогда мигратор не отказывает заранее, а DDL сам вернёт 1142
+     * с понятной подсказкой.
+     *
+     * @return array{missing: list<string>, certain: bool}
+     */
+    public function missingPrivileges(): array
     {
-        $value = $this->wpdb->get_var($this->wpdb->prepare(
-            "SELECT option_value FROM {$this->wpdb->options} WHERE option_name = %s",
-            self::VERSION_OPTION,
-        ));
+        $wpdb = $this->db->wpdb();
+        $suppress = $wpdb->suppress_errors(true);
+        try {
+            $lines = $wpdb->get_col('SHOW GRANTS');
+        } finally {
+            $wpdb->suppress_errors($suppress);
+        }
+        if (!\is_array($lines) || $lines === []) {
+            return ['missing' => [], 'certain' => false];
+        }
 
-        return $value === null ? 0 : (int) $value;
+        $database = $this->databaseName();
+        $granted = [];
+        $certain = true;
+        foreach ($lines as $line) {
+            $line = (string) $line;
+            // «GRANT `role`@`host` TO …» пропускаем: права АКТИВНЫХ ролей SHOW GRANTS уже показал строками
+            // «GRANT … ON …», а права неактивных ролей соединению WordPress и не действуют.
+            if (preg_match('/^GRANT\s+(.+?)\s+ON\s+(\S+)\s+TO\s/i', $line, $m) !== 1
+                || preg_match('/^PROXY$/i', $m[1]) === 1) {
+                continue;
+            }
+            [, $privileges, $scope] = $m;
+            if (preg_match('/^(\*|`(?:[^`]|``)+`)\.(\*|`(?:[^`]|``)+`)$/', $scope, $s) !== 1) {
+                $certain = false; // права на процедуры/функции и прочие нестандартные формы
+                continue;
+            }
+            if ($s[1] !== '*' && !self::grantDatabaseMatches(substr($s[1], 1, -1), $database)) {
+                continue;
+            }
+            if ($s[2] !== '*') {
+                // Права на отдельные таблицы плагина оценивать не беремся; на чужие (wp_options) — не важны.
+                if (str_starts_with(str_replace('``', '`', substr($s[2], 1, -1)), $this->wpdb()->prefix . 'book_')) {
+                    $certain = false;
+                }
+                continue;
+            }
+            foreach (preg_split('/\s*,\s*/', strtoupper((string) preg_replace('/\([^)]*\)/', '', $privileges))) ?: [] as $p) {
+                $granted[trim($p)] = true;
+            }
+        }
+        if (isset($granted['ALL']) || isset($granted['ALL PRIVILEGES'])) {
+            return ['missing' => [], 'certain' => true];
+        }
+
+        return [
+            'missing' => array_values(array_filter(self::REQUIRED_PRIVILEGES, static fn (string $p): bool => !isset($granted[$p]))),
+            'certain' => $certain,
+        ];
+    }
+
+    /**
+     * Не блокирует установку, но важно для эксплуатации (WP-CLI migrate/doctor, admin notice).
+     *
+     * @return list<string>
+     */
+    public function environmentWarnings(): array
+    {
+        $warnings = [];
+        $row = $this->db->getRow(
+            'SELECT @@GLOBAL.time_zone AS tz, @@system_time_zone AS system_tz, @@innodb_ft_min_token_size AS ft_min,
+                    TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), NOW()) AS offset_seconds'
+        );
+        if ($row !== null) {
+            $utc = \in_array($row['tz'], ['+00:00', 'UTC', 'Etc/UTC'], true)
+                || ($row['tz'] === 'SYSTEM' && \in_array($row['system_tz'], ['UTC', 'GMT'], true));
+            if (!$utc) {
+                $warnings[] = \sprintf(
+                    'MySQL default time zone is %s (offset %+d s). The plugin sets +00:00 inside its transactions, but other writers would get local time in DEFAULT CURRENT_TIMESTAMP columns. Recommended: default-time-zone = \'+00:00\' in my.cnf.',
+                    $row['tz'] === 'SYSTEM' ? 'SYSTEM/' . $row['system_tz'] : $row['tz'],
+                    (int) $row['offset_seconds'],
+                );
+            }
+            if ((int) $row['ft_min'] !== 3) {
+                $warnings[] = \sprintf('innodb_ft_min_token_size = %d (search expects 3). After changing it run `wp uniundata migrate --rebuild-fulltext`.', (int) $row['ft_min']);
+            }
+        }
+        $grants = $this->missingPrivileges();
+        if (!$grants['certain']) {
+            $warnings[] = 'Could not verify database privileges from SHOW GRANTS (table-level grants?); CREATE, ALTER, INDEX and REFERENCES are required.';
+        }
+
+        return $warnings;
     }
 
     // =============================================================================================
     // Миграции
     // =============================================================================================
 
-    /** v1: каноническая схема sql/schema.sql. */
-    private function m001InitialSchema(): void
+    /**
+     * v1: каноническая схема sql/schema.sql.
+     *
+     * @return list<string> Таблицы, у которых перестроены FULLTEXT-индексы.
+     */
+    private function m001InitialSchema(): array
     {
-        foreach ($this->schemaStatements() as $sql) {
-            if (preg_match('/^ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+CONSTRAINT\s+`?(\w+)`?/i', $sql, $m) === 1
-                && $this->constraintExists($m[1], $m[2])) {
-                continue; // повтор после частичного сбоя
+        $statements = $this->schemaStatements();
+        // Заранее созданные таблицы (вручную или прошлой упавшей попыткой) — для перестройки FULLTEXT.
+        $preexisting = array_values(array_filter(
+            array_map(fn (string $t): string => $this->wpdb()->prefix . $t, self::TABLES),
+            fn (string $table): bool => $this->tableExists($table),
+        ));
+
+        $this->withDdlSession(function () use ($statements): void {
+            foreach ($statements as $sql) {
+                if (preg_match('/^ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+CONSTRAINT\s+`?(\w+)`?/i', $sql, $m) === 1
+                    && $this->constraintExists($m[1], $m[2])) {
+                    continue; // повтор после частичного сбоя или таблицы созданы вручную
+                }
+                $this->exec($sql);
             }
-            $this->exec($sql);
+        });
+
+        // Сначала сверка: перестраивать индексы чужой, не совпадающей со схемой таблицы нельзя.
+        $this->assertSchema();
+        $rebuilt = [];
+        foreach (array_keys($this->fulltextIndexes()) as $table) {
+            if (\in_array($table, $preexisting, true)) {
+                $this->rebuildFulltext($table);
+                $rebuilt[] = $table;
+            }
         }
+
+        return $rebuilt;
+    }
+
+    /**
+     * Перестраивает ВСЕ FULLTEXT-индексы таблицы при innodb_ft_enable_stopword = OFF. Настройка стоп-слов
+     * хранится на уровне таблицы и меняется, только если удалить все её FULLTEXT-индексы, а затем создать
+     * их отдельными ALTER (по одному: ошибка 1795; «DROP INDEX x, ADD FULLTEXT x» одним ALTER оставляет
+     * старую настройку — проверено на 8.0.46). Пока индексов нет, поиск по таблице отвечает ошибкой 1191.
+     */
+    public function rebuildFulltext(string $table): void
+    {
+        $indexes = $this->fulltextIndexes()[$table] ?? [];
+        if ($indexes === []) {
+            return;
+        }
+        $this->withDdlSession(function () use ($table, $indexes): void {
+            foreach (array_keys($indexes) as $name) {
+                if ($this->indexExists($table, $name)) {
+                    $this->exec("ALTER TABLE `{$table}` DROP INDEX `{$name}`");
+                }
+            }
+            foreach ($indexes as $name => $columns) {
+                $this->exec("ALTER TABLE `{$table}` ADD FULLTEXT KEY `{$name}` ({$columns})");
+            }
+        });
     }
 
     // =============================================================================================
-    // SQL-файл
+    // SQL-файл и ожидаемая схема
     // =============================================================================================
 
     /**
@@ -159,23 +346,34 @@ final class Migrator
         if (!is_readable($this->schemaFile)) {
             throw new \RuntimeException(\sprintf('Schema file is missing: %s', $this->schemaFile));
         }
-        $sql = (string) file_get_contents($this->schemaFile);
-        $prefix = $this->wpdb->prefix;
+        $prefix = $this->wpdb()->prefix;
+        if (preg_match('/^[A-Za-z0-9_]+$/', $prefix) !== 1) {
+            throw new \RuntimeException('Unsupported table prefix');
+        }
 
         $out = [];
-        foreach (self::splitStatements($sql) as $statement) {
+        foreach (self::splitStatements((string) file_get_contents($this->schemaFile)) as $statement) {
             if (preg_match('/^SET\s/i', $statement) === 1) {
-                continue;
+                continue; // сессию задаёт withDdlSession()
             }
             $statement = (string) preg_replace('/^CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)/i', 'CREATE TABLE IF NOT EXISTS ', $statement);
-            // Только имена таблиц плагина: wp_users/wp_posts в комментариях не трогаем.
-            $statement = (string) preg_replace('/\bwp_(book_[a-z0-9_]+)\b/', $prefix . '$1', $statement);
-            if ($prefix !== 'wp_') {
-                $statement = (string) preg_replace_callback(
-                    '/\bCONSTRAINT\s+`?((?:ck|fk)_[a-z0-9_]+)`?/i',
-                    static fn (array $m): string => 'CONSTRAINT ' . self::constraintName($prefix, $m[1]),
-                    $statement,
-                );
+            // Таблицы плагина и имена их ограничений (wp_book_items_chk_status). wp_users/wp_posts не трогаем.
+            $statement = (string) preg_replace_callback(
+                '/\bwp_(book_[a-z0-9_]+)\b/',
+                static fn (array $m): string => $prefix . $m[1],
+                $statement,
+            );
+            if (preg_match_all('/\b(?:CONSTRAINT|TABLE(?:\s+IF\s+NOT\s+EXISTS)?)\s+`?(\w+)`?/i', $statement, $names) > 0) {
+                foreach ($names[1] as $name) {
+                    if (\strlen($name) > self::MAX_IDENTIFIER) {
+                        throw new \RuntimeException(\sprintf(
+                            'Table prefix "%s" is too long: identifier %s exceeds %d characters',
+                            $prefix,
+                            $name,
+                            self::MAX_IDENTIFIER,
+                        ));
+                    }
+                }
             }
             $out[] = $statement;
         }
@@ -184,18 +382,94 @@ final class Migrator
     }
 
     /**
-     * Имя ограничения для сайта с префиксом, отличным от wp_ (≤ 64 символов).
-     * Для префикса wp_ имена канонические: на них опираются сообщения об ошибках (3819 «Check constraint
-     * 'ck_reservations_attempt_range' is violated») в коде сервисов.
+     * Сверка существующих таблиц с schema.sql: колонки (utf8mb4, generated), индексы (уникальность,
+     * FULLTEXT), CHECK/FOREIGN KEY, движок. Лишние колонки/индексы допускаются (будущие миграции).
+     *
+     * @return list<string> Расхождения; пустой список — схема совпадает.
      */
-    public static function constraintName(string $prefix, string $name): string
+    public function verifySchema(): array
     {
-        $candidate = $prefix . $name;
-        if (\strlen($candidate) <= 64) {
-            return $candidate;
+        $expected = $this->expectedSchema();
+        $tables = array_keys($expected);
+        $in = $this->db->placeholders(\count($tables), '%s');
+        $problems = [];
+
+        $engines = [];
+        foreach ($this->db->getResults(
+            "SELECT TABLE_NAME AS t, ENGINE AS engine FROM information_schema.TABLES
+              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ({$in})",
+            ...$tables,
+        ) as $row) {
+            $engines[(string) $row['t']] = strtolower((string) $row['engine']);
         }
 
-        return substr($name, 0, 55) . '_' . substr(md5($prefix), 0, 8);
+        $columns = [];
+        foreach ($this->db->getResults(
+            "SELECT TABLE_NAME AS t, COLUMN_NAME AS c, CHARACTER_SET_NAME AS cs, EXTRA AS extra
+               FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ({$in})",
+            ...$tables,
+        ) as $row) {
+            $columns[(string) $row['t']][strtolower((string) $row['c'])] = $row;
+        }
+
+        $indexes = [];
+        foreach ($this->db->getResults(
+            "SELECT TABLE_NAME AS t, INDEX_NAME AS i, MIN(NON_UNIQUE) AS non_unique, MIN(INDEX_TYPE) AS type
+               FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ({$in})
+              GROUP BY TABLE_NAME, INDEX_NAME",
+            ...$tables,
+        ) as $row) {
+            $indexes[(string) $row['t']][(string) $row['i']] = $row;
+        }
+
+        $constraints = [];
+        foreach ($this->db->getResults(
+            "SELECT TABLE_NAME AS t, CONSTRAINT_NAME AS n FROM information_schema.TABLE_CONSTRAINTS
+              WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME IN ({$in}) AND CONSTRAINT_TYPE IN ('CHECK', 'FOREIGN KEY')",
+            ...$tables,
+        ) as $row) {
+            $constraints[(string) $row['t']][(string) $row['n']] = true;
+        }
+
+        foreach ($expected as $table => $spec) {
+            if (!isset($engines[$table])) {
+                $problems[] = "{$table}: table is missing";
+                continue;
+            }
+            if ($engines[$table] !== 'innodb') {
+                $problems[] = "{$table}: engine {$engines[$table]} instead of InnoDB";
+            }
+            foreach ($spec['columns'] as $column => $generated) {
+                $actual = $columns[$table][$column] ?? null;
+                if ($actual === null) {
+                    $problems[] = "{$table}: missing column {$column}";
+                    continue;
+                }
+                if ($actual['cs'] !== null && $actual['cs'] !== 'utf8mb4') {
+                    $problems[] = "{$table}.{$column}: character set {$actual['cs']} instead of utf8mb4";
+                }
+                if ($generated && stripos((string) $actual['extra'], 'STORED GENERATED') === false) {
+                    $problems[] = "{$table}.{$column}: must be a STORED generated column";
+                }
+            }
+            foreach ($spec['indexes'] as $name => $index) {
+                $actual = $indexes[$table][$name] ?? null;
+                if ($actual === null) {
+                    $problems[] = "{$table}: missing index {$name}";
+                } elseif ($index['type'] === 'unique' && $actual['non_unique'] !== '0') {
+                    $problems[] = "{$table}: index {$name} must be UNIQUE";
+                } elseif ($index['type'] === 'fulltext' && $actual['type'] !== 'FULLTEXT') {
+                    $problems[] = "{$table}: index {$name} must be FULLTEXT";
+                }
+            }
+            foreach ($spec['constraints'] as $name) {
+                if (!isset($constraints[$table][$name])) {
+                    $problems[] = "{$table}: missing constraint {$name}";
+                }
+            }
+        }
+
+        return $problems;
     }
 
     /**
@@ -228,7 +502,7 @@ final class Migrator
                 }
                 continue;
             }
-            if ($ch === '-' && $next === '-' && (($sql[$i + 2] ?? ' ') === ' ' || ($sql[$i + 2] ?? '') === "\t" || ($sql[$i + 2] ?? '') === "\n")) {
+            if ($ch === '-' && $next === '-' && \in_array($sql[$i + 2] ?? "\n", [' ', "\t", "\n", "\r"], true)) {
                 $end = strpos($sql, "\n", $i);
                 $i = $end === false ? $len : $end;
                 $buf .= "\n";
@@ -267,81 +541,243 @@ final class Migrator
         return $statements;
     }
 
+    /**
+     * Ожидаемая структура из schemaStatements(): разбор тела CREATE TABLE по запятым верхнего уровня.
+     *
+     * @return array<string, array{columns: array<string, bool>, indexes: array<string, array{type: string, columns: string}>, constraints: list<string>}>
+     */
+    private function expectedSchema(): array
+    {
+        if ($this->expected !== null) {
+            return $this->expected;
+        }
+        $schema = [];
+        foreach ($this->schemaStatements() as $sql) {
+            if (preg_match('/^ALTER\s+TABLE\s+`?(\w+)`?\s+ADD\s+CONSTRAINT\s+`?(\w+)`?/i', $sql, $m) === 1) {
+                $schema[$m[1]] = ($schema[$m[1]] ?? []) + ['columns' => [], 'indexes' => [], 'constraints' => []];
+                $schema[$m[1]]['constraints'][] = $m[2];
+                continue;
+            }
+            if (preg_match('/^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?\s*\(/i', $sql, $m, PREG_OFFSET_CAPTURE) !== 1) {
+                continue;
+            }
+            $table = $m[1][0];
+            $schema[$table] = ($schema[$table] ?? []) + ['columns' => [], 'indexes' => [], 'constraints' => []];
+            foreach (self::topLevelParts($sql, $m[0][1] + \strlen($m[0][0])) as $part) {
+                if (preg_match('/^PRIMARY\s+KEY\b/i', $part) === 1) {
+                    $schema[$table]['indexes']['PRIMARY'] = ['type' => 'unique', 'columns' => ''];
+                } elseif (preg_match('/^(UNIQUE|FULLTEXT)?\s*(?:KEY|INDEX)\s+`?(\w+)`?\s*\((.*)\)$/is', $part, $k) === 1) {
+                    $schema[$table]['indexes'][$k[2]] = [
+                        'type' => strtolower($k[1] !== '' ? $k[1] : 'key'),
+                        'columns' => (string) preg_replace('/\s+/', ' ', trim($k[3])),
+                    ];
+                } elseif (preg_match('/^CONSTRAINT\s+`?(\w+)`?/i', $part, $k) === 1) {
+                    $schema[$table]['constraints'][] = $k[1];
+                } elseif (preg_match('/^`?(\w+)`?\s/', $part, $k) === 1) {
+                    $schema[$table]['columns'][strtolower($k[1])] = stripos($part, 'GENERATED ALWAYS AS') !== false;
+                }
+            }
+        }
+
+        return $this->expected = $schema;
+    }
+
+    /** @return array<string, array<string, string>> таблица → [имя FULLTEXT-индекса → список колонок] */
+    private function fulltextIndexes(): array
+    {
+        $out = [];
+        foreach ($this->expectedSchema() as $table => $spec) {
+            foreach ($spec['indexes'] as $name => $index) {
+                if ($index['type'] === 'fulltext') {
+                    $out[$table][$name] = $index['columns'];
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Части тела CREATE TABLE от $offset до парной «)»: запятые внутри скобок и строк не делят.
+     *
+     * @return list<string>
+     */
+    private static function topLevelParts(string $sql, int $offset): array
+    {
+        $parts = [];
+        $buf = '';
+        $depth = 0;
+        $quote = null;
+        for ($i = $offset, $len = \strlen($sql); $i < $len; ++$i) {
+            $ch = $sql[$i];
+            if ($quote !== null) {
+                $buf .= $ch;
+                if ($ch === '\\') {
+                    $buf .= $sql[++$i] ?? '';
+                } elseif ($ch === $quote) {
+                    $quote = null;
+                }
+                continue;
+            }
+            if ($ch === "'" || $ch === '"' || $ch === '`') {
+                $quote = $ch;
+            } elseif ($ch === '(') {
+                ++$depth;
+            } elseif ($ch === ')') {
+                if ($depth === 0) {
+                    break;
+                }
+                --$depth;
+            } elseif ($ch === ',' && $depth === 0) {
+                $parts[] = trim($buf);
+                $buf = '';
+                continue;
+            }
+            $buf .= $ch;
+        }
+        if (trim($buf) !== '') {
+            $parts[] = trim($buf);
+        }
+
+        return $parts;
+    }
+
     // =============================================================================================
     // information_schema
     // =============================================================================================
 
     public function tableExists(string $table): bool
     {
-        return (bool) $this->wpdb->get_var($this->wpdb->prepare(
+        return $this->db->getVar(
             'SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
             $table,
-        ));
+        ) !== '0';
     }
 
     public function columnExists(string $table, string $column): bool
     {
-        return (bool) $this->wpdb->get_var($this->wpdb->prepare(
+        return $this->db->getVar(
             'SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s',
             $table,
             $column,
-        ));
+        ) !== '0';
+    }
+
+    public function indexExists(string $table, string $index): bool
+    {
+        return $this->db->getVar(
+            'SELECT COUNT(*) FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s',
+            $table,
+            $index,
+        ) !== '0';
     }
 
     public function constraintExists(string $table, string $constraint): bool
     {
-        return (bool) $this->wpdb->get_var($this->wpdb->prepare(
+        return $this->db->getVar(
             'SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS
               WHERE CONSTRAINT_SCHEMA = DATABASE() AND TABLE_NAME = %s AND CONSTRAINT_NAME = %s',
             $table,
             $constraint,
-        ));
+        ) !== '0';
     }
 
-    /** Все таблицы на месте и в InnoDB (CREATE TABLE IF NOT EXISTS не исправит чужую таблицу с тем же именем). */
-    private function assertTables(): void
+    // =============================================================================================
+    // Внутреннее
+    // =============================================================================================
+
+    private function assertSchema(): void
     {
-        $names = array_map(fn (string $t): string => $this->wpdb->prefix . $t, self::TABLES);
-        $placeholders = implode(', ', array_fill(0, \count($names), '%s'));
-        $rows = $this->wpdb->get_results($this->wpdb->prepare(
-            "SELECT TABLE_NAME AS name, ENGINE AS engine FROM information_schema.TABLES
-              WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN ({$placeholders})",
-            ...$names,
-        ), ARRAY_A);
-        $found = [];
-        foreach ((array) $rows as $row) {
-            $found[(string) $row['name']] = strtolower((string) $row['engine']);
+        $problems = $this->verifySchema();
+        if ($problems !== []) {
+            throw new \RuntimeException(\sprintf(
+                'Existing tables do not match sql/schema.sql (created manually or by another version?): %s%s',
+                implode('; ', \array_slice($problems, 0, 10)),
+                \count($problems) > 10 ? \sprintf('; … %d more', \count($problems) - 10) : '',
+            ));
         }
-        foreach ($names as $name) {
-            if (!isset($found[$name])) {
-                throw new \RuntimeException(\sprintf('Table %s was not created', $name));
+    }
+
+    /**
+     * Сессия DDL на общем соединении $wpdb: utf8mb4 (комментарии и литералы CHECK по-русски) и FULLTEXT
+     * без стоп-слов. После DDL — исходные значения: стоп-слова из переменной, кодировка — wpdb::set_charset().
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function withDdlSession(callable $fn): mixed
+    {
+        $wpdb = $this->wpdb();
+        $this->exec("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_520_ci");
+        $this->exec('SET @uniundata_ft_stopword = @@SESSION.innodb_ft_enable_stopword, SESSION innodb_ft_enable_stopword = OFF');
+        try {
+            return $fn();
+        } finally {
+            $suppress = $wpdb->suppress_errors(true);
+            $wpdb->query('SET SESSION innodb_ft_enable_stopword = COALESCE(@uniundata_ft_stopword, @@SESSION.innodb_ft_enable_stopword)');
+            if ($wpdb->dbh instanceof \mysqli) {
+                $wpdb->set_charset($wpdb->dbh);
             }
-            if ($found[$name] !== 'innodb') {
-                throw new \RuntimeException(\sprintf('Table %s uses %s instead of InnoDB', $name, $found[$name]));
-            }
+            $wpdb->suppress_errors($suppress);
         }
     }
 
     private function exec(string $sql): void
     {
-        // CREATE … не проходит проверку кодировок wpdb (strip_invalid_text_from_query их пропускает),
-        // поэтому COMMENT на русском допустим. Ошибку не печатаем в ответ — бросаем исключение.
-        $suppress = $this->wpdb->suppress_errors(true);
+        $wpdb = $this->wpdb();
+        // Ошибку не печатаем в ответ — бросаем исключение.
+        $suppress = $wpdb->suppress_errors(true);
         try {
-            $ok = $this->wpdb->query($sql);
-            if ($ok === false) {
-                $hint = str_contains((string) $this->wpdb->last_error, 'Duplicate')
-                    ? ' (constraint name collision with another table in this database?)'
-                    : '';
+            if ($wpdb->query($sql) === false) {
+                $errno = $this->db->lastErrno();
+                $hint = match (true) {
+                    $errno === 1142 || $errno === 1044 => ' (missing privilege: CREATE, ALTER, INDEX and REFERENCES are required)',
+                    $errno === 3822 || $errno === 1826 => ' (constraint name is used by another table in this database)',
+                    $errno === 1059 => ' (identifier too long: shorten the table prefix)',
+                    default => '',
+                };
                 throw new \RuntimeException(\sprintf(
-                    'Migration statement failed: %s%s. Statement: %s',
-                    $this->wpdb->last_error,
+                    'Migration statement failed: [%d] %s%s. Statement: %s',
+                    $errno,
+                    $wpdb->last_error,
                     $hint,
                     mb_substr(preg_replace('/\s+/', ' ', $sql) ?? '', 0, 160),
                 ));
             }
         } finally {
-            $this->wpdb->suppress_errors($suppress);
+            $wpdb->suppress_errors($suppress);
         }
+    }
+
+    private function wpdb(): \wpdb
+    {
+        return $this->db->wpdb();
+    }
+
+    private function databaseName(): string
+    {
+        return (string) $this->db->getVar('SELECT DATABASE()');
+    }
+
+    /** Имя БД в GRANT — шаблон: `_` и `%` — подстановочные символы, `\_` и `\%` — буквальные. */
+    private static function grantDatabaseMatches(string $pattern, string $database): bool
+    {
+        $pattern = str_replace('``', '`', $pattern);
+        $regex = '';
+        for ($i = 0, $len = \strlen($pattern); $i < $len; ++$i) {
+            $ch = $pattern[$i];
+            if ($ch === '\\' && $i + 1 < $len) {
+                $regex .= preg_quote($pattern[++$i], '/');
+            } elseif ($ch === '%') {
+                $regex .= '.*';
+            } elseif ($ch === '_') {
+                $regex .= '.';
+            } else {
+                $regex .= preg_quote($ch, '/');
+            }
+        }
+
+        return preg_match('/^' . $regex . '$/si', $database) === 1;
     }
 }

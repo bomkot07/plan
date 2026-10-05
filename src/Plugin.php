@@ -24,13 +24,18 @@ use Uniundata\Books\Sync\SyncService;
  *
  * Порядок (docs/01-architecture.md § 1.4):
  *   register_activation_hook → activate(): окружение + миграции + роли + options по умолчанию;
- *   plugins_loaded (5)       → boot(): фильтр кодировки таблиц, догоняющая миграция, остальные хуки;
+ *   plugins_loaded (5)       → boot(): догоняющая миграция, остальные хуки;
  *   init                     → Roles::maybeUpgrade(), register_meta(middle_name);
  *   rest_api_init            → Rest\*Controller::register_routes();
- *   action_scheduler_init    → Scheduler::ensureRecurring() (в Scheduler::register());
+ *   Action Scheduler         → Scheduler::register(): обработчики ВСЕХ задач плагина (группа 'uniundata') —
+ *                              recurring uniundata_expire_reservations / _expire_orders (60 с), _sync_daily (03:15 UTC),
+ *                              _abandon_carts и _privacy_retention (ежедневно); async uniundata_order_paid {order_id},
+ *                              _refund_payment {refund_id} → PaymentService::processRefund(),
+ *                              _order_needs_attention {order_id, reason}, _user_deleted_cleanup {user_id},
+ *                              _sync_continue {source, run_id}, _sync_alert {run_id, code};
  *   map_meta_cap             → view_book_order, delete_user;
- *   delete_user / wpmu_delete_user → снятие резервов, отмена неоплаченных заказов, отложенная анонимизация;
- *   wp_privacy_personal_data_exporters / _erasers → экспорт и обезличивание данных магазина.
+ *   delete_user / wpmu_delete_user → снятие резервов, отмена неоплаченных заказов, отложенное обезличивание;
+ *   wp_privacy_personal_data_exporters / _erasers → экспорт и обезличивание данных магазина (152-ФЗ; GDPR).
  *
  * Контейнер — минимальный: явные фабрики для сервисов с настройками и autowiring по типам конструктора
  * для остальных классов плагина (контроллеры, сервисы без скалярных параметров).
@@ -54,11 +59,26 @@ final class Plugin
     private const MONEY_IN_FLIGHT = ['pending_payment', 'payment_processing', 'paid'];
     /** Неоплаченные заказы, которые отменяются при удалении аккаунта. */
     private const CANCELLABLE_ORDERS = ['draft', 'pending_payment', 'payment_failed'];
-    /** «Закрытый» заказ для целей PII (docs/07 § 7.11). */
-    private const CLOSED_ORDER_SQL = "(status IN ('completed', 'refunded', 'cancelled', 'payment_expired')
-                                       OR (status = 'partially_refunded' AND fulfilled_at IS NOT NULL))";
+    /**
+     * «Закрытый» заказ для целей ПДн (docs/07 § 7.11): исполнен, возвращён или не оплачен, без открытого
+     * разбора и без незавершённого возврата. Алиас таблицы — o.
+     */
+    private const CLOSED_ORDER_SQL = "(o.status IN ('completed', 'refunded', 'cancelled', 'payment_expired')
+                                       OR (o.status = 'partially_refunded' AND o.fulfilled_at IS NOT NULL))
+                                      AND o.needs_attention = 0
+                                      AND NOT EXISTS (SELECT 1 FROM %s rf WHERE rf.order_id = o.id AND rf.status IN ('requested', 'pending'))";
 
-    public const HOOK_USER_CLEANUP = 'uniundata_user_deleted_cleanup';
+    /**
+     * Сроки хранения ПДн по умолчанию — технические заглушки, их утверждает юрист (152-ФЗ: срок — до
+     * достижения цели обработки; бухгалтерские документы — по 402-ФЗ). Меняются фильтрами
+     * uniundata_retention_contact_days, uniundata_consent_ip_retention_days, uniundata_retention_accounting_years.
+     */
+    public const RETENTION_CONTACT_DAYS = 730;
+    public const RETENTION_CONSENT_IP_DAYS = 180;
+    public const RETENTION_ACCOUNTING_YEARS = 10;
+    private const RETENTION_BATCH = 500;
+    /** Маркер этапа 2 (ФИО). Этап 1 отмечается колонкой orders.pii_erased_at. */
+    private const ANONYMIZED = 'Anonymized';
 
     private static ?self $instance = null;
 
@@ -114,7 +134,7 @@ final class Plugin
                     (float) apply_filters('uniundata_sync_missing_threshold', SyncService::MISSING_THRESHOLD),
                 );
             },
-            Migrator::class => static fn (self $p): object => new Migrator($p->wpdb(), self::schemaFile()),
+            Migrator::class => static fn (self $p): object => new Migrator($p->get(Db::class), self::schemaFile()),
         ];
     }
 
@@ -150,7 +170,6 @@ final class Plugin
     public static function installForSite(): void
     {
         $plugin = self::instance();
-        self::registerCharsetFilter();
         try {
             $plugin->get(Migrator::class)->migrate(30);
         } catch (\RuntimeException $e) {
@@ -166,8 +185,12 @@ final class Plugin
         add_option('uniundata_payment_ttl_minutes', 30);
         add_option('uniundata_payment_grace_minutes', 10);
         add_option('uniundata_reservation_minutes', 60); // менять только вместе с бизнес-правилами
+        add_option('uniundata_max_active_reservations', 10);
         add_option('uniundata_sync_source', 'primary', '', false);
         add_option('uniundata_terms_versions', [], '', false); // заполняет администратор: version + sha256
+        // uniundata_currency (ISO 4217, «валюта магазина») по умолчанию НЕ задаётся: её выбирает администратор
+        // (`wp option update uniundata_currency RUB`). Пока её нет — резерв, checkout и синхронизация
+        // отказывают, а в админке висит уведомление (configProblems()).
     }
 
     /** Таблицы, роли и данные остаются: деактивация обратима. Снимаются только задачи плагина. */
@@ -185,7 +208,6 @@ final class Plugin
     public static function boot(): void
     {
         $plugin = self::instance();
-        self::registerCharsetFilter();
 
         // Activation hook не вызывается при обновлении файлами/автообновлении — догоняем здесь.
         // Основной путь — шаг деплоя `wp uniundata migrate`; это страховка (lock wait ≤ 5 с).
@@ -232,24 +254,23 @@ final class Plugin
         // Удаление пользователя и приватность подписаны всегда; при отстающей схеме обработчики сами ничего не делают.
         add_action('delete_user', [$this, 'onDeleteUser'], 10, 1);
         add_action('wpmu_delete_user', [$this, 'onDeleteNetworkUser'], 10, 1);
-        add_action(self::HOOK_USER_CLEANUP, [$this, 'cleanupDeletedUser'], 10, 1);
         add_filter('wp_privacy_personal_data_exporters', [$this, 'registerPrivacyExporters']);
         add_filter('wp_privacy_personal_data_erasers', [$this, 'registerPrivacyErasers']);
+        add_action('admin_notices', [$this, 'adminNotices']);
+
+        // Обработчики задач Action Scheduler подписываются в КАЖДОМ процессе (WP-CLI, WP-Cron, async runner) и
+        // при отстающей схеме тоже: задача без обработчика помечается failed и теряется, а Scheduler такую
+        // задачу откладывает на 5 минут (recurring-задачи при этом не ставятся).
+        $this->get(Scheduler::class)->register();
 
         if (\defined('WP_CLI') && WP_CLI) {
             // migrate/doctor доступны и при отстающей схеме — именно ими её и чинят.
             Commands::register($this);
         }
 
-        if (!$this->schemaReady) {
-            add_action('admin_notices', [$this, 'schemaNotice']);
-
-            return;
+        if ($this->schemaReady) {
+            add_action('rest_api_init', [$this, 'registerRestRoutes']);
         }
-
-        add_action('rest_api_init', [$this, 'registerRestRoutes']);
-        // Обработчики задач Action Scheduler подписываются в КАЖДОМ процессе (WP-CLI, WP-Cron, async runner).
-        $this->get(Scheduler::class)->register();
     }
 
     // =============================================================================================
@@ -336,45 +357,6 @@ final class Plugin
                 error_log(\sprintf('[uniundata] REST controller %s is disabled: %s', $class, $e->getMessage()));
             }
         }
-    }
-
-    // =============================================================================================
-    // Кодировка таблиц для $wpdb
-    // =============================================================================================
-
-    /**
-     * В таблицах плагина смешаны колонки ascii (статусы, ключи, хэши) и utf8mb4 (тексты). Для такой таблицы
-     * wpdb::get_table_charset() возвращает 'ascii', и wpdb::query() ОТВЕРГАЕТ любой запрос с не-ASCII
-     * текстом («Could not perform query because it contains invalid data»): INSERT названия «Война и мир»,
-     * FULLTEXT-поиск «толстой», снимок ФИО в заказе (проверено на WordPress 7.1.2 + MySQL 8.0.46).
-     * Фильтр сообщает wpdb реальную кодировку текстовых колонок. Защиту от «битого» UTF-8 при этом
-     * сохраняет сам wpdb (регулярное выражение utf8mb4), а запись не-ASCII в ascii-колонку остановит
-     * STRICT_TRANS_TABLES (Db включает его на время транзакций) ошибкой 1366.
-     */
-    public static function registerCharsetFilter(): void
-    {
-        if (!has_filter('pre_get_table_charset', [self::class, 'filterTableCharset'])) {
-            add_filter('pre_get_table_charset', [self::class, 'filterTableCharset'], 10, 2);
-            // wpdb::get_col_charset() ($wpdb->insert/update) после короткого замыкания таблицы читал бы
-            // непрогретый кэш колонок (Undefined array key) — отвечаем и за колонки.
-            add_filter('pre_get_col_charset', [self::class, 'filterTableCharset'], 10, 2);
-        }
-    }
-
-    public static function filterTableCharset(mixed $charset, mixed $table): mixed
-    {
-        global $wpdb;
-        if (!\is_string($table) || $charset !== null) {
-            return $charset;
-        }
-        $name = strtolower(trim($table, '`'));
-        // wp_book_items, wp_2_book_items (мультисайт): базовый префикс + необязательный ID сайта.
-        if (preg_match('/^' . preg_quote(strtolower($wpdb->base_prefix), '/') . '(?:\d+_)?(book_[a-z_]+)$/', $name, $m) === 1
-            && \in_array($m[1], Migrator::TABLES, true)) {
-            return 'utf8mb4';
-        }
-
-        return $charset;
     }
 
     // =============================================================================================
@@ -537,13 +519,14 @@ final class Plugin
             }
         }
 
-        // 4. PII — после удаления строки wp_users, идемпотентно, с повтором Action Scheduler.
+        // 4. ПДн — после удаления строки wp_users, идемпотентно, задачей Action Scheduler. Без unique: в AS 3.9
+        //    уникальность проверяется по hook + group БЕЗ args, и задача второго удалённого пользователя пропала бы.
         if (\function_exists('as_enqueue_async_action')) {
-            as_enqueue_async_action(self::HOOK_USER_CLEANUP, ['user_id' => $userId], Scheduler::GROUP, true);
+            as_enqueue_async_action(Scheduler::HOOK_USER_CLEANUP, ['user_id' => $userId], Scheduler::GROUP);
         }
     }
 
-    /** Задача Action Scheduler: удаление состоялось → обезличить данные магазина. */
+    /** Задача uniundata_user_deleted_cleanup: удаление состоялось → обезличить данные магазина. */
     public function cleanupDeletedUser(int $userId): void
     {
         if ($userId <= 0 || get_userdata($userId) !== false) {
@@ -561,7 +544,7 @@ final class Plugin
     }
 
     // =============================================================================================
-    // Приватность (GDPR): экспорт и обезличивание
+    // Персональные данные (152-ФЗ; GDPR — для покупателей из ЕС): экспорт, удаление, сроки хранения
     // =============================================================================================
 
     /**
@@ -701,8 +684,8 @@ final class Plugin
     }
 
     /**
-     * Эрейзер: удаляем, что можно (профиль, middle_name, маркетинговые согласия, IP), заказы — обезличиваем
-     * (этап 1 для закрытых), строки заказов/платежей/продаж не удаляем (бухгалтерия, ТЗ). Аккаунт не удаляется.
+     * Эрейзер: удаляем, что можно (профиль, middle_name, маркетинговые согласия, IP), закрытые заказы —
+     * обезличиваем (этап 1), строки заказов/платежей/продаж не удаляем (бухгалтерия, ТЗ). Аккаунт не удаляется.
      *
      * @return array{items_removed: bool, items_retained: bool, messages: list<string>, done: bool}
      */
@@ -736,13 +719,100 @@ final class Plugin
     }
 
     /**
-     * Этап 1 обезличивания (docs/07 § 7.11). Идемпотентно; одиночные UPDATE без других блокировок.
+     * Задача uniundata_privacy_retention (ежедневно). Каждый шаг — пакет одиночных UPDATE по wp_book_orders или
+     * wp_book_user_consents без других блокировок (взаимной блокировки с checkout/webhook быть не может).
+     *   1. IP и хэш UA в согласиях старше RETENTION_CONSENT_IP_DAYS — NULL (ix_consents_retention).
+     *   2. Этап 1 (контакты) для закрытых заказов, у которых pii_erased_at IS NULL и:
+     *      истёк RETENTION_CONTACT_DAYS (ix_orders_retention), ИЛИ аккаунт удалён, ИЛИ был запрос на удаление.
+     *   3. Этап 2 (ФИО, платёжный адрес) после бухгалтерского срока RETENTION_ACCOUNTING_YEARS.
+     *
+     * @return array{consents: int, contacts: int, names: int}
+     */
+    public function privacyRetention(int $batch = self::RETENTION_BATCH): array
+    {
+        if (!$this->schemaReady) {
+            return ['consents' => 0, 'contacts' => 0, 'names' => 0];
+        }
+        $db = $this->get(Db::class);
+        $wpdb = $this->wpdb();
+        $batch = max(1, min($batch, 5000));
+        $ipDays = max(1, (int) apply_filters('uniundata_consent_ip_retention_days', self::RETENTION_CONSENT_IP_DAYS));
+        $contactDays = max(1, (int) apply_filters('uniundata_retention_contact_days', self::RETENTION_CONTACT_DAYS));
+        $years = max(1, (int) apply_filters('uniundata_retention_accounting_years', self::RETENTION_ACCOUNTING_YEARS));
+        $orders = $db->table('orders');
+        $closed = $this->closedOrderSql($db);
+
+        $consents = $db->execute(
+            "UPDATE {$db->table('user_consents')} SET ip_address = NULL, user_agent_sha256 = NULL
+              WHERE accepted_at < UTC_TIMESTAMP(6) - INTERVAL %d DAY
+                AND (ip_address IS NOT NULL OR user_agent_sha256 IS NOT NULL)
+              LIMIT %d",
+            $ipDays,
+            $batch,
+        );
+
+        // Кандидаты — обычным чтением (двумя запросами: без OR оба идут range по ix_orders_retention), UPDATE
+        // перепроверяет условие на заблокированной версии строки. ORDER BY не нужен: обработанные строки
+        // выпадают из условия (pii_erased_at), а ORDER BY id увёл бы план на полный проход по PRIMARY.
+        $ids = array_column($db->getResults(
+            "SELECT o.id FROM {$orders} o
+              WHERE o.pii_erased_at IS NULL AND {$closed} AND o.updated_at < UTC_TIMESTAMP(6) - INTERVAL %d DAY
+              LIMIT %d",
+            $contactDays,
+            $batch,
+        ), 'id');
+        // Догоняющий этап 1: заказы удалённых аккаунтов и запросивших удаление, закрытые уже после запроса.
+        $ids = array_merge($ids, array_column($db->getResults(
+            "SELECT o.id FROM {$orders} o
+              WHERE o.pii_erased_at IS NULL AND {$closed}
+                AND (NOT EXISTS (SELECT 1 FROM {$wpdb->users} u WHERE u.ID = o.user_id)
+                     OR EXISTS (SELECT 1 FROM {$wpdb->usermeta} m
+                                 WHERE m.user_id = o.user_id AND m.meta_key = 'uniundata_erasure_requested_at'))
+              LIMIT %d",
+            $batch,
+        ), 'id'));
+        $ids = array_values(array_unique(array_map('intval', $ids)));
+        $contacts = $ids === [] ? 0 : $this->eraseContacts($db, 'o.id IN (' . $db->placeholders(\count($ids)) . ')', $ids);
+
+        $names = $db->execute(
+            "UPDATE {$orders} o
+                SET o.customer_first_name = %s, o.customer_last_name = %s, o.customer_middle_name = NULL,
+                    o.billing_address_json = IF(o.billing_address_json IS NULL, NULL,
+                        JSON_OBJECT('v', 1, 'redacted', TRUE,
+                                    'country_code', JSON_UNQUOTE(JSON_EXTRACT(o.billing_address_json, '$.country_code'))))
+              WHERE o.pii_erased_at IS NOT NULL
+                AND o.customer_last_name <> %s
+                AND COALESCE(o.completed_at, o.cancelled_at, o.paid_at, o.placed_at, o.created_at)
+                    < UTC_TIMESTAMP(6) - INTERVAL %d YEAR
+              LIMIT %d",
+            self::ANONYMIZED,
+            self::ANONYMIZED,
+            self::ANONYMIZED,
+            $years,
+            $batch,
+        );
+
+        if ($consents + $contacts + $names > 0) {
+            $this->get(AuditLog::class)->record('privacy.retention_applied', 'system', null, null, null, [
+                'consents_minimized' => $consents,
+                'orders_contacts_erased' => $contacts,
+                'orders_names_anonymized' => $names,
+            ], 'cron');
+        }
+
+        return ['consents' => $consents, 'contacts' => $contacts, 'names' => $names];
+    }
+
+    /**
+     * Этап 1 обезличивания пользователя (docs/07 § 7.11). Идемпотентно; одиночные UPDATE без других блокировок.
      *
      * @return array{profile_deleted: bool, consents_minimized: int, orders_redacted: int, open_orders: int, retained_orders: int}
      */
     private function redactUser(int $userId, string $reason): array
     {
         $db = $this->get(Db::class);
+        $orders = $db->table('orders');
+        $closed = $this->closedOrderSql($db);
         $profileDeleted = $db->execute("DELETE FROM {$db->table('customer_profiles')} WHERE user_id = %d", $userId) > 0;
         $consents = $db->execute(
             "UPDATE {$db->table('user_consents')} SET withdrawn_at = UTC_TIMESTAMP(6)
@@ -754,26 +824,9 @@ final class Plugin
               WHERE user_id = %d AND (ip_address IS NOT NULL OR user_agent_sha256 IS NOT NULL)",
             $userId,
         );
-        $redacted = $db->execute(
-            "UPDATE {$db->table('orders')}
-                SET customer_email = CONCAT('erased-', id, '@invalid.invalid'),
-                    customer_phone = NULL,
-                    shipping_address_json = IF(shipping_address_json IS NULL, NULL,
-                        JSON_OBJECT('v', 1, 'redacted', TRUE,
-                                    'country_code', JSON_UNQUOTE(JSON_EXTRACT(shipping_address_json, '$.country_code'))))
-              WHERE user_id = %d AND " . self::CLOSED_ORDER_SQL . '
-                AND customer_email NOT LIKE %s',
-            $userId,
-            'erased-%@invalid.invalid',
-        );
-        $open = (int) $db->getVar(
-            "SELECT COUNT(*) FROM {$db->table('orders')} WHERE user_id = %d AND NOT " . self::CLOSED_ORDER_SQL,
-            $userId,
-        );
-        $retained = (int) $db->getVar(
-            "SELECT COUNT(*) FROM {$db->table('orders')} WHERE user_id = %d AND " . self::CLOSED_ORDER_SQL,
-            $userId,
-        );
+        $redacted = $this->eraseContacts($db, 'o.user_id = %d', [$userId]);
+        $open = (int) $db->getVar("SELECT COUNT(*) FROM {$orders} o WHERE o.user_id = %d AND NOT ({$closed})", $userId);
+        $retained = (int) $db->getVar("SELECT COUNT(*) FROM {$orders} o WHERE o.user_id = %d AND {$closed}", $userId);
         $this->get(AuditLog::class)->record('privacy.user_redacted', 'user', $userId, null, null, [
             'reason' => $reason,
             'profile_deleted' => $profileDeleted,
@@ -789,6 +842,33 @@ final class Plugin
             'open_orders' => $open,
             'retained_orders' => $retained,
         ];
+    }
+
+    /**
+     * Этап 1 для закрытых заказов по условию $where (алиас o): email → заглушка в зоне .invalid (колонка
+     * NOT NULL, RFC 2606 — письмо уйти не может), телефон → NULL, адрес доставки → только страна,
+     * pii_erased_at = сейчас. Признак «уже обезличен» — pii_erased_at, а не содержимое полей.
+     *
+     * @param list<int> $args
+     */
+    private function eraseContacts(Db $db, string $where, array $args): int
+    {
+        return $db->execute(
+            "UPDATE {$db->table('orders')} o
+                SET o.customer_email = CONCAT('erased-', o.id, '@invalid.invalid'),
+                    o.customer_phone = NULL,
+                    o.shipping_address_json = IF(o.shipping_address_json IS NULL, NULL,
+                        JSON_OBJECT('v', 1, 'redacted', TRUE,
+                                    'country_code', JSON_UNQUOTE(JSON_EXTRACT(o.shipping_address_json, '$.country_code')))),
+                    o.pii_erased_at = UTC_TIMESTAMP(6)
+              WHERE {$where} AND o.pii_erased_at IS NULL AND {$this->closedOrderSql($db)}",
+            ...$args,
+        );
+    }
+
+    private function closedOrderSql(Db $db): string
+    {
+        return '(' . sprintf(self::CLOSED_ORDER_SQL, $db->table('refunds')) . ')';
     }
 
     private static function addressText(?string $json): string
@@ -821,16 +901,47 @@ final class Plugin
         ]);
     }
 
-    public function schemaNotice(): void
+    /** Схема не на версии кода или магазин не настроен — уведомление администратору. */
+    public function adminNotices(): void
     {
-        if (!current_user_can('activate_plugins')) {
+        if (!current_user_can('manage_options')) {
             return;
         }
-        printf(
-            '<div class="notice notice-error"><p><strong>Uniundata Books:</strong> %s</p><p><code>%s</code></p></div>',
-            esc_html__('The database schema is not up to date. The shop is disabled until `wp uniundata migrate` succeeds.', 'uniundata-books'),
-            esc_html((string) $this->schemaError),
-        );
+        $problems = $this->schemaReady
+            ? $this->configProblems()
+            : [__('The database schema is not up to date. The shop is disabled until `wp uniundata migrate` succeeds.', 'uniundata-books') . ' ' . $this->schemaError];
+        foreach ($problems as $problem) {
+            printf('<div class="notice notice-error"><p><strong>Uniundata Books:</strong> %s</p></div>', esc_html($problem));
+        }
+    }
+
+    /**
+     * Обязательные настройки, без которых магазин отказывает (резерв/checkout — 500, синхронизация — failed).
+     *
+     * @return list<string>
+     */
+    public function configProblems(): array
+    {
+        $problems = [];
+        if (preg_match('/^[A-Z]{3}$/', (string) get_option('uniundata_currency', '')) !== 1) {
+            $problems[] = __('Shop currency is not set: wp option update uniundata_currency RUB (ISO 4217).', 'uniundata-books');
+        }
+        $terms = get_option('uniundata_terms_versions', []);
+        foreach (['offer', 'privacy'] as $type) {
+            $t = \is_array($terms) ? ($terms[$type] ?? null) : null;
+            if (!\is_array($t) || !isset($t['version'], $t['sha256']) || preg_match('/^[0-9a-f]{64}$/', (string) $t['sha256']) !== 1) {
+                /* translators: %s: offer|privacy */
+                $problems[] = \sprintf(__('Current %s document version is not set (option uniundata_terms_versions: version + sha256).', 'uniundata-books'), $type);
+            }
+        }
+        if (!apply_filters('uniundata_payment_provider', null) instanceof PaymentProviderInterface) {
+            $problems[] = __('No payment provider configured (filter uniundata_payment_provider): checkout is disabled.', 'uniundata-books');
+        }
+        if (!\function_exists('as_enqueue_async_action')) {
+            $problems[] = __('Action Scheduler is not loaded: reservations and unpaid orders are not released.', 'uniundata-books');
+        }
+
+        return $problems;
     }
 
     public function isSchemaReady(): bool

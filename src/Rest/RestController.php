@@ -21,7 +21,8 @@ use Uniundata\Books\Infrastructure\AuditLog;
  *  - permission_callback для пользовательских маршрутов: 401 `uniundata_auth_required`, если
  *    пользователь не определён (в том числе cookie без `X-WP-Nonce`), 403 `uniundata_forbidden`, если
  *    нет capability;
- *  - rate limit по user_id и IP (объектный кэш, если он персистентный, иначе транзиенты).
+ *  - rate limit по user_id и IP: счётчики в транзиентах (работают без постоянного объектного кэша —
+ *    тогда это строки wp_options), при Redis/Memcached — атомарный wp_cache_incr.
  *
  * user_id берётся только из get_current_user_id(), никогда из параметров запроса.
  */
@@ -49,6 +50,8 @@ abstract class RestController
         // Публичный endpoint: за NAT офиса/кампуса много покупателей делят один IP — лимит щедрый.
         'availability' => ['ip' => [300, 60]],
         'admin_write' => ['user' => [60, 60]],
+        // Webhook: считаются только ОТКЛОНЁННЫЕ доставки (подпись/тело) с IP; принятые не считаются.
+        'webhook_rejected' => ['ip' => [20, 60]],
     ];
 
     private const RATE_LIMIT_GROUP = 'uniundata_rl';
@@ -270,54 +273,104 @@ abstract class RestController
      */
     protected function enforceRateLimit(string $action): void
     {
-        $all = apply_filters('uniundata_rate_limits', self::DEFAULT_RATE_LIMITS);
-        $limits = \is_array($all) && isset($all[$action]) && \is_array($all[$action]) ? $all[$action] : null;
+        $limits = self::rateLimits($action);
         if ($limits === null) {
             return;
         }
 
         $userId = get_current_user_id();
-        if ($userId > 0 && self::isLimit($limits['user'] ?? null)) {
-            $this->hit($action . '|u|' . $userId, (int) $limits['user'][0], (int) $limits['user'][1]);
+        if ($userId > 0 && isset($limits['user'])) {
+            $this->hit($action . '|u|' . $userId, ...$limits['user']);
         }
         $ip = $this->clientIp();
-        if ($ip !== null && self::isLimit($limits['ip'] ?? null)) {
-            $this->hit($action . '|ip|' . $ip, (int) $limits['ip'][0], (int) $limits['ip'][1]);
+        if ($ip !== null && isset($limits['ip'])) {
+            $this->hit($action . '|ip|' . $ip, ...$limits['ip']);
         }
     }
 
-    private static function isLimit(mixed $limit): bool
+    /**
+     * Действующие лимиты действия после фильтра `uniundata_rate_limits`; null — лимита нет
+     * (фильтр может отключить действие, вернув для него null).
+     *
+     * @return array{user?: array{0: int, 1: int}, ip?: array{0: int, 1: int}}|null
+     */
+    protected static function rateLimits(string $action): ?array
     {
-        return \is_array($limit) && \is_int($limit[0] ?? null) && \is_int($limit[1] ?? null)
-            && $limit[0] > 0 && $limit[1] > 0;
+        $all = apply_filters('uniundata_rate_limits', self::DEFAULT_RATE_LIMITS);
+        $limits = \is_array($all) && isset($all[$action]) && \is_array($all[$action]) ? $all[$action] : null;
+        if ($limits === null) {
+            return null;
+        }
+        $out = [];
+        foreach (['user', 'ip'] as $subject) {
+            $limit = $limits[$subject] ?? null;
+            if (\is_array($limit) && \is_int($limit[0] ?? null) && \is_int($limit[1] ?? null) && $limit[0] > 0 && $limit[1] > 0) {
+                $out[$subject] = [$limit[0], $limit[1]];
+            }
+        }
+
+        return $out === [] ? null : $out;
     }
 
+    /** +1 к счётчику окна; превышение → 429. */
     private function hit(string $subject, int $limit, int $windowSeconds): void
     {
-        $now = time();
-        $window = intdiv($now, $windowSeconds);
-        // wp_hash (HMAC с солью сайта): в Redis / wp_options не лежат IP и user_id в открытом виде.
-        $key = 'uniundata_rl_' . substr(wp_hash($subject . '|' . $windowSeconds), 0, 24) . '_' . $window;
+        if ($this->bumpCounter($subject, $windowSeconds) > $limit) {
+            throw DomainError::rateLimited(self::secondsToWindowEnd($windowSeconds));
+        }
+    }
+
+    /**
+     * Фиксированное окно: +1 и новое значение. Ключ — wp_hash (HMAC с солью сайта), поэтому в Redis и
+     * wp_options не лежат IP и user_id в открытом виде.
+     *
+     * Транзиенты работают в любой конфигурации: без постоянного объектного кэша это строки wp_options
+     * (read-modify-write не атомарен — при гонке счётчик может недосчитать несколько запросов, для мягкого
+     * лимита допустимо), с Redis/Memcached — атомарные wp_cache_add + wp_cache_incr.
+     */
+    protected function bumpCounter(string $subject, int $windowSeconds): int
+    {
+        $key = self::counterKey($subject, $windowSeconds);
         $ttl = $windowSeconds + 5;
 
         if (wp_using_ext_object_cache()) {
-            // Redis/Memcached: add + incr атомарны, счётчик точный при параллельных запросах.
             wp_cache_add($key, 0, self::RATE_LIMIT_GROUP, $ttl);
             $count = wp_cache_incr($key, 1, self::RATE_LIMIT_GROUP);
             if ($count === false) {
                 wp_cache_set($key, 1, self::RATE_LIMIT_GROUP, $ttl);
                 $count = 1;
             }
-        } else {
-            // Без персистентного кэша — транзиенты в wp_options: read-modify-write не атомарен, при гонке
-            // счётчик может недосчитать несколько запросов. Для мягкого лимита это допустимо.
-            $count = (int) get_transient($key) + 1;
-            set_transient($key, $count, $ttl);
+
+            return (int) $count;
         }
 
-        if ($count > $limit) {
-            throw DomainError::rateLimited(max(1, ($window + 1) * $windowSeconds - $now));
-        }
+        $count = (int) get_transient($key) + 1;
+        set_transient($key, $count, $ttl);
+
+        return $count;
+    }
+
+    /** Текущее значение счётчика окна без увеличения. */
+    protected function readCounter(string $subject, int $windowSeconds): int
+    {
+        $key = self::counterKey($subject, $windowSeconds);
+
+        return (int) (wp_using_ext_object_cache()
+            ? wp_cache_get($key, self::RATE_LIMIT_GROUP)
+            : get_transient($key));
+    }
+
+    protected static function secondsToWindowEnd(int $windowSeconds): int
+    {
+        $now = time();
+
+        return max(1, (intdiv($now, $windowSeconds) + 1) * $windowSeconds - $now);
+    }
+
+    private static function counterKey(string $subject, int $windowSeconds): string
+    {
+        // ≤ 172 символов имени транзиента: 'uniundata_rl_' + 24 + '_' + номер окна.
+        return 'uniundata_rl_' . substr(wp_hash($subject . '|' . $windowSeconds), 0, 24) . '_' . intdiv(time(), $windowSeconds);
     }
 
     /**

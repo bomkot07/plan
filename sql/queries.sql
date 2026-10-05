@@ -1,12 +1,14 @@
 -- =====================================================================
--- Uniundata Books — примеры SQL-запросов (MySQL 8.0.16+, схема sql/schema.sql)
+-- Uniundata Books — примеры SQL-запросов (MySQL 8.0.16+, схема v2 sql/schema.sql)
 --
--- Плейсхолдеры — пользовательские переменные @…: файл выполняется целиком в mysql-клиенте.
+-- Плейсхолдеры — пользовательские переменные @…: файл выполняется целиком в mysql-клиенте
+-- (`mysql --default-character-set=utf8mb4 <БД> < sql/queries.sql`: без флага клиент работает в latin1
+-- и кириллица в литералах ломается).
 -- В PHP те же запросы идут через $wpdb->prepare() (%d / %s), префикс `wp_` → $wpdb->prefix,
 -- IN-списки строятся Db::placeholders(); пользовательский ввод в текст SQL не попадает никогда.
 --
 -- Все запросы выполнены на MySQL 8.0.46 на тестовых данных (6 000 записей и экземпляров, 3 000 персон,
--- 3 200 резервов, 120 заказов, 100 продаж, 31 прогон синхронизации). Под каждым ключевым запросом —
+-- 3 200 резервов, 120 заказов, 100 продаж, 2 возврата, 200 согласий, 31 прогон синхронизации). Под ключевым запросом —
 -- фактический план EXPLAIN (key / type / Extra). При других объёмах оптимизатор может выбрать другой
 -- план — проверяйте EXPLAIN ANALYZE на продакшен-статистике.
 --
@@ -41,7 +43,8 @@ SELECT r.id, r.title, r.subtitle, r.authors_text, r.publication_year, r.cover_ur
  ORDER BY r.title_sort, r.id
  LIMIT 24;
 
--- 1.2. Экземпляры «в продаже» по возрастанию цены с диапазоном цены (центы), keyset по (price_amount, id).
+-- 1.2. Экземпляры «в продаже» по возрастанию цены с диапазоном цены (минимальные единицы валюты — копейки),
+--      keyset по (price_amount, id).
 -- EXPLAIN: i range ix_items_catalog (is_active, availability_status, price_amount); Using index condition;
 --          r eq_ref PRIMARY; без filesort.
 SET @price_min = 1000, @price_max = 5000, @after_price = 0, @after_id = 0;
@@ -127,13 +130,18 @@ SELECT s.id, s.heading, s.thesaurus
 -- =====================================================================
 
 -- 2.1. Основная строка поиска: FULLTEXT ft_records_main (title, subtitle, authors_text, series_title),
--- BOOLEAN MODE. PHP строит запрос из слов пользователя: каждое слово ≥ 3 символов → '+слово*',
--- спецсимволы булева синтаксиса (+-<>()~*"@) вырезаются. Сортировка по релевантности — пагинация
--- OFFSET (keyset по score нестабилен), но не дальше 10 страниц.
+-- BOOLEAN MODE. PHP строит запрос из слов пользователя: спецсимволы булева синтаксиса (+-<>()~*"@)
+-- вырезаются; слово длиной ≥ innodb_ft_min_token_size (3) → '+слово*'; КОРОЧЕ 3 символов — в запрос
+-- не попадает: такие слова не индексируются, и обязательное '+и' или '+и*' обнуляет выдачу
+-- («война и мир» → '+война* +мир*': 751 строка; '+война +и +мир' — 0, проверено на 8.0.46).
+-- Если коротких слов больше нет — поиск не выполняется (подсказка «уточните запрос»).
+-- Стоп-слов нет: индексы построены при innodb_ft_enable_stopword = OFF (Migrator), поэтому '+und',
+-- '+the', '+for' работают. Сортировка по релевантности — пагинация OFFSET (keyset по score нестабилен),
+-- но не дальше 10 страниц.
 -- EXPLAIN: r fulltext ft_records_main; Using where; Using filesort — только по найденным строкам
 --          (ORDER BY score, id: второй ключ нужен для стабильного порядка между страницами);
 --          i ref ix_items_record_status для in_stock.
-SET @q = '+толст* +войн*';
+SET @q = '+толст* +войн*';  -- из «Толстой. Война и мир»: «и» отброшено
 SELECT r.id, r.title, r.authors_text, r.publication_year,
        MATCH (r.title, r.subtitle, r.authors_text, r.series_title) AGAINST (@q IN BOOLEAN MODE) AS score,
        EXISTS (SELECT 1 FROM wp_book_items i
@@ -211,12 +219,19 @@ SELECT r.id, r.title, r.authors_text
 -- Страницы каталога кэшируются целиком; кнопки получают живой статус этим запросом (≤ 100 id, no-store).
 -- @user_id = 0 — гость: can_reserve = 0, reason = login_required. Для своего резерва — срок и флаг held_by_me,
 -- для своего неоплаченного заказа — public_order_id; attempts_left считается без released_by_admin.
+-- can_reserve учитывает валюту магазина (option uniundata_currency: экземпляр в другой валюте не
+-- резервируется) и лимит одновременных активных резервов (option uniundata_max_active_reservations, 10).
+-- Это только подсказка для кнопки: окончательно всё перепроверяет reserve() под FOR UPDATE.
 -- Список id — JSON_TABLE (в PHP — IN (%d, %d, …) через Db::placeholders()).
 -- EXPLAIN: ids ALL (табличная функция json_table, ≤ 100 строк); i eq_ref PRIMARY; me eq_ref
 --          uq_reservations_one_active_per_item (active_book_item_id); попытки — ref uq_reservations_attempt
 --          (Using index, покрывающий); свой открытый заказ — o ref uq_orders_checkout_request (user_id …) +
 --          oi eq_ref uq_order_items_item (order_id, book_item_id).
-SET @user_id = 21, @item_ids = '[50, 51, 52, 2001, 2101, 101, 102, 103, 999999]';
+SET @user_id = 21, @item_ids = '[50, 51, 52, 104, 2001, 2101, 101, 102, 103, 999999]',
+    @shop_currency = 'RUB', @max_active = 10;
+-- Активные резервы пользователя (ix_reservations_user (user_id, reservation_status, expires_at)).
+SET @my_active = (SELECT COUNT(*) FROM wp_book_reservations
+                   WHERE user_id = @user_id AND reservation_status = 'active' AND expires_at > UTC_TIMESTAMP(6));
 SELECT ids.id AS book_item_id,
        i.availability_status IS NOT NULL AS exists_flag,
        CASE i.availability_status
@@ -237,10 +252,12 @@ SELECT ids.id AS book_item_id,
          WHERE oi.book_item_id = ids.id AND o.user_id = @user_id
            AND o.status IN ('draft', 'pending_payment', 'payment_processing', 'payment_failed')
          LIMIT 1) AS my_open_order,
-       (@user_id > 0
+       COALESCE(@user_id > 0
         AND i.availability_status = 'available' AND i.is_active = 1
+        AND i.currency = @shop_currency
+        AND @my_active < @max_active
         AND (SELECT COUNT(*) FROM wp_book_reservations a
-              WHERE a.user_id = @user_id AND a.book_item_id = ids.id AND a.attempt_no IS NOT NULL) < 3) AS can_reserve
+              WHERE a.user_id = @user_id AND a.book_item_id = ids.id AND a.attempt_no IS NOT NULL) < 3, 0) AS can_reserve
   FROM JSON_TABLE(@item_ids, '$[*]' COLUMNS (id BIGINT UNSIGNED PATH '$')) AS ids
   LEFT JOIN wp_book_items i ON i.id = ids.id
   LEFT JOIN wp_book_reservations me ON me.active_book_item_id = ids.id AND me.user_id = @user_id;
@@ -314,7 +331,7 @@ SELECT o.id, o.public_order_id, o.status, o.payment_due_at
  ORDER BY o.payment_due_at
  LIMIT 100;
 
--- 5.4. Пустые открытые корзины без активности 30 дней → abandoned (ежедневно).
+-- 5.4. Пустые открытые корзины без активности 30 дней → abandoned (ежедневная задача uniundata_abandon_carts).
 --      EXPLAIN: range ix_carts_status_activity (status, last_activity_at).
 SELECT c.id, c.user_id, c.last_activity_at
   FROM wp_book_carts c
@@ -426,19 +443,32 @@ ORDER BY at, kind;
 -- 8. Отчёт по синхронизациям
 -- =====================================================================
 
--- 8.1. Последние прогоны источника со счётчиками и признаком «завис» (heartbeat > 15 минут).
+-- 8.1. Последние прогоны источника со счётчиками и признаком «завис» (heartbeat старше 900 с —
+--      SyncService::STALE_AFTER_SECONDS). resumed_from_run_id — какой упавший прогон продолжен,
+--      pass_started_run_id — первый прогон полного прохода; source_cursor: NULL — читать с начала,
+--      '' — источник прочитан, идёт проход «пропавших», иначе — курсор источника.
 --      EXPLAIN: ref ix_sync_runs_source (source_name, started_at), Backward index scan, без filesort
 --      (проверено при 3 000 прогонах 30 источников; при 31 строке оптимизатор честно выбирает ALL).
 SET @source = 'primary';
-SELECT id, triggered_by, status, started_at, finished_at,
+SELECT id, triggered_by, status, started_at, finished_at, resumed_from_run_id, pass_started_run_id, source_cursor,
        TIMESTAMPDIFF(SECOND, started_at, COALESCE(finished_at, UTC_TIMESTAMP(6))) AS duration_s,
        records_received, records_created, records_updated, records_skipped,
        items_created, items_updated, items_skipped, items_conflicts, items_missing, items_withdrawn, errors_count,
-       status = 'running' AND heartbeat_at < UTC_TIMESTAMP(6) - INTERVAL 15 MINUTE AS is_stale
+       status = 'running' AND heartbeat_at < UTC_TIMESTAMP(6) - INTERVAL 900 SECOND AS is_stale
   FROM wp_book_sync_runs
  WHERE source_name = @source
  ORDER BY started_at DESC, id DESC
  LIMIT 10;
+
+-- 8.1a. Цепочка прохода: все прогоны, которые продолжали друг друга (упал → retry → …).
+WITH RECURSIVE chain AS (
+  SELECT id, resumed_from_run_id, status, 0 AS depth FROM wp_book_sync_runs
+   WHERE running_source = @source                              -- текущий running-прогон (uq_sync_runs_one_running)
+  UNION ALL
+  SELECT r.id, r.resumed_from_run_id, r.status, c.depth + 1
+    FROM wp_book_sync_runs r JOIN chain c ON r.id = c.resumed_from_run_id
+)
+SELECT id, status, depth FROM chain ORDER BY depth;
 
 -- 8.2. Ошибки последних прогонов из error_log (JSON) построчно. EXPLAIN: ref ix_sync_runs_source; e — табличная функция.
 SELECT sr.id AS run_id, sr.status, e.code, e.external_id, e.message
@@ -469,13 +499,14 @@ SELECT availability_status, source_status, COUNT(*) AS items
  GROUP BY availability_status, source_status
  ORDER BY availability_status, source_status;
 
--- 8.5. Кандидаты в «пропавшие» после полного прохода, начатого прогоном @pass_run_id (то же условие,
---      что у SyncService::missingCounts / прохода sync_missing).
+-- 8.5. Кандидаты в «пропавшие» после полного прохода (то же условие, что у SyncService::missingCounts /
+--      прохода sync_missing). Порог — pass_started_run_id текущего прогона: экземпляры, которые встречались
+--      в любом прогоне цепочки прохода, имеют last_seen_sync_run_id ≥ этого id.
 --      Подсчёт — один проход по экземплярам источника за прогон (ALL/ref по source_name; 100 тыс. строк ≈ десятки мс).
 --      Выборка кандидатов: при доле кандидатов в единицы процентов — range ix_items_sync
 --      (source_name, last_seen_sync_run_id; `IS NULL OR < N` — два интервала) + filesort по id найденных
 --      (проверено: 59 кандидатов из 6 000); когда кандидатов нет вовсе — range PRIMARY (id > N) с фильтром.
-SET @pass_run_id = 100;
+SET @pass_run_id = COALESCE((SELECT pass_started_run_id FROM wp_book_sync_runs WHERE running_source = @source), 100);
 SELECT COUNT(*) AS active_items,
        SUM(last_seen_sync_run_id IS NULL OR last_seen_sync_run_id < @pass_run_id) AS would_be_missing
   FROM wp_book_items
@@ -523,11 +554,35 @@ SELECT o.id, o.public_order_id, o.paid_at, o.total_amount, o.currency
  LIMIT 100;
 
 -- 9.4. Срок оплаты вышел более 10 минут назад, а заказ всё ещё открыт — задача expiry не работает (алерт).
---      EXPLAIN: range ix_orders_payment_due.
+--      Заказы с needs_attention (amount_mismatch, reference_mismatch) cron не закрывает намеренно — их
+--      решает менеджер, поэтому они исключены. EXPLAIN: range ix_orders_payment_due.
 SELECT o.id, o.public_order_id, o.status, o.payment_due_at
   FROM wp_book_orders o
  WHERE o.status IN ('draft', 'pending_payment', 'payment_processing', 'payment_failed')
+   AND o.needs_attention = 0
    AND o.payment_due_at < UTC_TIMESTAMP(6) - INTERVAL 10 MINUTE;
+
+-- 9.5. Очередь возвратов: requested/pending, старые сверху (обрабатывает задача uniundata_refund_payment
+--      {refund_id}; дольше суток — повод разобраться вручную).
+--      EXPLAIN (3 000 возвратов): rf range ix_refunds_status (status, requested_at); Using index condition;
+--      Using filesort только по найденным строкам (два интервала IN); p/o eq_ref PRIMARY.
+SELECT rf.id, rf.status, rf.reason, rf.amount, rf.currency, rf.requested_at, o.public_order_id, p.provider_payment_id
+  FROM wp_book_refunds rf
+  JOIN wp_book_orders o ON o.id = rf.order_id
+  JOIN wp_book_payments p ON p.id = rf.payment_id
+ WHERE rf.status IN ('requested', 'pending')
+ ORDER BY rf.requested_at
+ LIMIT 100;
+
+-- 9.6. Возвраты и платежи заказа (карточка заказа менеджера).
+--      EXPLAIN: p ref uq_payments_attempt (order_id, attempt_no); rf ref ix_refunds_payment.
+SET @order_id = 8;
+SELECT p.id AS payment_id, p.attempt_no, p.status AS payment_status, p.amount, p.refunded_amount,
+       rf.id AS refund_id, rf.status AS refund_status, rf.reason, rf.amount AS refund_amount
+  FROM wp_book_payments p
+  LEFT JOIN wp_book_refunds rf ON rf.payment_id = p.id
+ WHERE p.order_id = @order_id
+ ORDER BY p.attempt_no, rf.id;
 
 
 -- =====================================================================
@@ -565,7 +620,7 @@ SELECT r.id AS reservation_id
   LEFT JOIN wp_book_cart_items ci ON ci.reservation_id = r.id AND ci.status = 'active'
  WHERE r.reservation_status = 'active' AND r.cart_id IS NOT NULL AND ci.id IS NULL;
 
--- 10.4. checkout_pending без открытого заказа.
+-- 10.4. checkout_pending без открытого заказа (заказ с needs_attention держит экземпляры до решения менеджера).
 --       EXPLAIN: i ALL; NOT EXISTS материализуется (<subquery2> по <auto_distinct_key>, anti-join).
 SELECT i.id, i.status_changed_at
   FROM wp_book_items i
@@ -574,7 +629,8 @@ SELECT i.id, i.status_changed_at
                      FROM wp_book_order_items oi
                      JOIN wp_book_orders o ON o.id = oi.order_id
                     WHERE oi.book_item_id = i.id
-                      AND o.status IN ('draft', 'pending_payment', 'payment_processing', 'payment_failed'));
+                      AND (o.status IN ('draft', 'pending_payment', 'payment_processing', 'payment_failed')
+                           OR o.needs_attention = 1));
 
 -- 10.5. Открытый заказ держит экземпляр, который не checkout_pending (освобождён раньше времени).
 SELECT o.id AS order_id, o.status, oi.book_item_id, i.availability_status
@@ -614,10 +670,103 @@ HAVING o.subtotal_amount <> items_sum;
 SELECT p.id AS payment_id, p.order_id, p.amount, o.total_amount
   FROM wp_book_payments p
   JOIN wp_book_orders o ON o.id = p.order_id
- WHERE p.status = 'succeeded' AND (p.amount <> o.total_amount OR p.currency <> o.currency) AND o.needs_attention = 0;
+ WHERE p.status IN ('succeeded', 'partially_refunded', 'refunded')
+   AND (p.amount <> o.total_amount OR p.currency <> o.currency) AND o.needs_attention = 0;
 
 -- 10.10. Активный резерв просрочен более чем на 10 минут — задача expiry не работает (алерт, а не порча данных).
 --        EXPLAIN: range ix_reservations_expiry.
 SELECT COUNT(*) AS overdue_reservations, MIN(expires_at) AS oldest_expiry
   FROM wp_book_reservations
  WHERE reservation_status = 'active' AND expires_at < UTC_TIMESTAMP(6) - INTERVAL 10 MINUTE;
+
+-- 10.11. payments.refunded_amount = сумма успешных возвратов платежа (CHECK refunded_amount <= amount
+--        держит схема, равенство — PaymentService). EXPLAIN: p ALL; rf ref ix_refunds_payment.
+SELECT p.id AS payment_id, p.refunded_amount,
+       (SELECT COALESCE(SUM(rf.amount), 0) FROM wp_book_refunds rf WHERE rf.payment_id = p.id AND rf.status = 'succeeded') AS refunds_sum
+  FROM wp_book_payments p
+HAVING p.refunded_amount <> refunds_sum;
+
+-- 10.12. Возврат завис: requested/pending дольше суток (алерт; банк не ответил, задача падает).
+SELECT id, order_id, status, requested_at
+  FROM wp_book_refunds
+ WHERE status IN ('requested', 'pending') AND requested_at < UTC_TIMESTAMP(6) - INTERVAL 1 DAY;
+
+
+-- =====================================================================
+-- 11. Персональные данные: сроки хранения (задача uniundata_privacy_retention, 152-ФЗ / GDPR)
+-- =====================================================================
+-- Признак этапа 1 (контакты обезличены) — orders.pii_erased_at, а не содержимое полей. Каждый шаг —
+-- одиночные UPDATE по одной таблице пакетами, без других блокировок. Сроки — фильтры
+-- uniundata_retention_contact_days (730), uniundata_consent_ip_retention_days (180),
+-- uniundata_retention_accounting_years (10): заглушки до решения юриста.
+-- «Закрытый» заказ: completed | refunded | cancelled | payment_expired (или partially_refunded после отгрузки),
+-- без needs_attention и без незавершённого возврата.
+
+-- 11.1. Кандидаты этапа 1 — двумя запросами без OR и без ORDER BY: так оба идут range по
+--       ix_orders_retention (pii_erased_at, status, updated_at). Проверено на 30 тыс. заказов: с ORDER BY id
+--       или с OR-условием «аккаунт удалён» в том же запросе план уходит в полный проход по PRIMARY.
+-- а) истёк срок хранения контактов. EXPLAIN: o range ix_orders_retention; Using index condition;
+--    rf — материализованный NOT EXISTS (Not exists).
+SET @contact_days = 730;
+SELECT o.id, o.status, o.updated_at
+  FROM wp_book_orders o
+ WHERE o.pii_erased_at IS NULL
+   AND (o.status IN ('completed', 'refunded', 'cancelled', 'payment_expired')
+        OR (o.status = 'partially_refunded' AND o.fulfilled_at IS NOT NULL))
+   AND o.needs_attention = 0
+   AND NOT EXISTS (SELECT 1 FROM wp_book_refunds rf WHERE rf.order_id = o.id AND rf.status IN ('requested', 'pending'))
+   AND o.updated_at < UTC_TIMESTAMP(6) - INTERVAL @contact_days DAY
+ LIMIT 500;
+
+-- б) догоняющий: аккаунт удалён или был запрос на удаление, а заказ закрылся позже.
+--    EXPLAIN: o ref ix_orders_attention / ix_orders_retention (необработанные закрытые заказы);
+--    u eq_ref PRIMARY (wp_users); m ref user_id (wp_usermeta).
+SELECT o.id, o.user_id, o.status
+  FROM wp_book_orders o
+ WHERE o.pii_erased_at IS NULL
+   AND (o.status IN ('completed', 'refunded', 'cancelled', 'payment_expired')
+        OR (o.status = 'partially_refunded' AND o.fulfilled_at IS NOT NULL))
+   AND o.needs_attention = 0
+   AND NOT EXISTS (SELECT 1 FROM wp_book_refunds rf WHERE rf.order_id = o.id AND rf.status IN ('requested', 'pending'))
+   AND (NOT EXISTS (SELECT 1 FROM wp_users u WHERE u.ID = o.user_id)
+        OR EXISTS (SELECT 1 FROM wp_usermeta m
+                    WHERE m.user_id = o.user_id AND m.meta_key = 'uniundata_erasure_requested_at'))
+ LIMIT 500;
+
+-- 11.2. Этап 1 для найденных id (в PHP — IN (%d, …); условие «закрыт» перепроверяется на заблокированной
+--       версии строки). Пример на одном заказе в транзакции с откатом — данные теста не меняются.
+START TRANSACTION;
+UPDATE wp_book_orders o
+   SET o.customer_email = CONCAT('erased-', o.id, '@invalid.invalid'),
+       o.customer_phone = NULL,
+       o.shipping_address_json = IF(o.shipping_address_json IS NULL, NULL,
+           JSON_OBJECT('v', 1, 'redacted', TRUE,
+                       'country_code', JSON_UNQUOTE(JSON_EXTRACT(o.shipping_address_json, '$.country_code')))),
+       o.pii_erased_at = UTC_TIMESTAMP(6)
+ WHERE o.id IN (21, 22) AND o.pii_erased_at IS NULL
+   AND o.status IN ('completed', 'refunded', 'cancelled', 'payment_expired') AND o.needs_attention = 0;
+SELECT ROW_COUNT() AS contacts_erased;
+ROLLBACK;
+
+-- 11.3. Этап 2 (ФИО, платёжный адрес) после бухгалтерского срока — только по уже обезличенным контактам.
+--       EXPLAIN: o range ix_orders_retention (pii_erased_at IS NOT NULL); Using index condition. Диапазон —
+--       все обезличенные заказы (растёт со временем); признак этапа 2 — 'Anonymized' в фамилии (отдельной
+--       колонки в схеме v2 нет).
+SET @accounting_years = 10;
+SELECT o.id, COALESCE(o.completed_at, o.cancelled_at, o.paid_at, o.placed_at, o.created_at) AS closed_at
+  FROM wp_book_orders o
+ WHERE o.pii_erased_at IS NOT NULL
+   AND o.customer_last_name <> 'Anonymized'
+   AND COALESCE(o.completed_at, o.cancelled_at, o.paid_at, o.placed_at, o.created_at)
+       < UTC_TIMESTAMP(6) - INTERVAL @accounting_years YEAR
+ LIMIT 500;
+
+-- 11.4. IP и хэш User-Agent в согласиях старше 180 дней (в PHP — UPDATE … SET ip_address = NULL,
+--       user_agent_sha256 = NULL с тем же WHERE и LIMIT 500).
+--       EXPLAIN (30 тыс. согласий): range ix_consents_retention (accepted_at); Using index condition.
+SET @ip_days = 180;
+SELECT id, accepted_at
+  FROM wp_book_user_consents
+ WHERE accepted_at < UTC_TIMESTAMP(6) - INTERVAL @ip_days DAY
+   AND (ip_address IS NOT NULL OR user_agent_sha256 IS NOT NULL)
+ LIMIT 500;

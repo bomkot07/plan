@@ -12,36 +12,46 @@ use Uniundata\Books\Infrastructure\Db;
  * Ежедневная синхронизация каталога: идемпотентный upsert пакетами по 200 записей.
  *
  * Защита от параллельных запусков — два слоя:
- *   1. GET_LOCK('uniundata_sync_<source>@<db+prefix hash>', 0) — пока процесс работает. Блокировка
- *      принадлежит соединению MySQL: умер процесс или оборвалось соединение — она снята сервером.
- *      Хэш БД и префикса в имени нужен потому, что имена GET_LOCK общие для всего сервера MySQL
- *      (несколько сайтов на одном сервере иначе блокировали бы друг друга).
+ *   1. GET_LOCK(Db::lockName('sync_<source>'), 0) — пока процесс работает. Блокировка принадлежит
+ *      соединению MySQL: умер процесс или оборвалось соединение — она снята сервером. Db::lockName() добавляет
+ *      отпечаток БД и префикса: имена GET_LOCK общие для всего сервера MySQL (new.libsmr.ru и shop.libsmr.ru).
  *   2. Строка wp_book_sync_runs со status = 'running' + UNIQUE(running_source) — «аренда» прогона между
  *      процессами (цепочка задач Action Scheduler держит прогон, но не блокировку, между шагами).
- *      heartbeat_at обновляется каждым пакетом; прогон без heartbeat дольше 15 минут считается зависшим:
- *      следующий запуск помечает его aborted и продолжает с его source_cursor.
+ *      heartbeat_at обновляется каждым пакетом; прогон без heartbeat дольше STALE_AFTER_SECONDS (900 с)
+ *      считается зависшим: следующий запуск помечает его aborted и продолжает с его source_cursor.
  *
- * Каждый пакет — отдельная транзакция Db::transaction() (READ COMMITTED, повтор при deadlock), в которой
- * вместе с данными сдвигаются курсор и счётчики прогона: после падения в любой точке повтор пакета ничего
- * не удваивает (checksum + курсор). HTTP к источнику — только вне транзакции.
+ * Состояние прохода — в колонках прогона:
+ *   pass_started_run_id — первый прогон полного прохода (для свежего прогона — он сам): экземпляры с
+ *                         last_seen_sync_run_id < pass_started_run_id не встречались в этом проходе;
+ *   resumed_from_run_id — упавший/зависший прогон, который продолжает этот;
+ *   source_cursor       — NULL: читать источник с начала; курсор источника: продолжить с него;
+ *                         '' (пустая строка): источник прочитан полностью, идёт проход «пропавших».
  *
- * Порядок блокировок в пакете (согласован с глобальным порядком docs/08):
- *   строка прогона → wp_book_items (FOR UPDATE по возрастанию id) → wp_book_records (UPDATE) →
- *   contributors/subjects/identifiers. Записи книг блокируются ПОСЛЕ экземпляров: checkout и webhook
- *   ставят S-блокировку на запись (проверка FK при INSERT в order_items/sales) тоже после экземпляров,
- *   поэтому цикла ожиданий нет.
+ * Транзакции пакета (HTTP к источнику — только вне транзакций):
+ *   A. записи: строка прогона → wp_book_records (FOR UPDATE по возрастанию id, INSERT/UPDATE) →
+ *      идентификаторы, персоны, рубрики; счётчики records_*;
+ *   B. экземпляры: строка прогона → wp_book_items (FOR UPDATE по возрастанию id, INSERT/UPDATE); счётчики
+ *      items_*, ошибки и курсор — в той же транзакции, поэтому повтор пакета после падения ничего не удваивает.
+ * X-блокировки записей и экземпляров НИКОГДА не берутся в одной транзакции (глобальный порядок docs/08:
+ * 0) sync_runs и records, затем items). В B есть только неявная S-блокировка записи при проверке FK
+ * для INSERT нового экземпляра — та же, что у checkout/webhook при INSERT order_items/sales; X на запись в
+ * этот момент никто не держит (транзакцию A той же синхронизации сериализует GET_LOCK).
+ * Сбой между A и B безопасен: при повторе записи совпадут по checksum, экземпляры догонятся в B.
  *
  * Локальные статусы reserved / checkout_pending / sold / blocked синхронизация не меняет никогда:
  * меняется только source_status (что говорит источник), растёт items_conflicts. При освобождении резерва
  * или заказа экземпляр получает release target по source_status (контракт).
  *
- * Требование к окружению: фильтр pre_get_table_charset из Plugin (иначе $wpdb отвергает запросы с
- * не-ASCII текстом к таблицам, где смешаны колонки ascii и utf8mb4).
+ * Экземпляр с валютой, отличной от валюты магазина (option uniundata_currency), не импортируется и не
+ * обновляется (только отметка «есть в источнике»): ошибка currency_mismatch в error_log прогона.
  */
 final class SyncService
 {
     public const BATCH_SIZE = 200;
+    /** Прогон без heartbeat дольше — зависший (то же значение использует AdminController). */
     public const STALE_AFTER_SECONDS = 900;
+    /** Имя источника (SourceClientInterface::name(), REST-параметр source): ≤ 32, чтобы имя GET_LOCK было ≤ 64. */
+    public const SOURCE_NAME_PATTERN = '^[a-z0-9_-]{1,32}$';
     /** Порог безопасности прохода «пропавших»: доля активных экземпляров источника. */
     public const MISSING_THRESHOLD = 0.10;
 
@@ -50,6 +60,9 @@ final class SyncService
     public const HOOK_CONTINUE = 'uniundata_sync_continue';
     /** Алерт оператору (порог missing, failed). Аргументы: [run_id, code]. */
     public const HOOK_ALERT = 'uniundata_sync_alert';
+
+    /** source_cursor = '' — источник прочитан полностью, остался проход «пропавших». */
+    private const CURSOR_READ_DONE = '';
 
     private const RESUME_WINDOW_HOURS = 36;
     private const MAX_ERROR_LOG = 50;
@@ -83,9 +96,13 @@ final class SyncService
     /** Что изменилось за вызов run() — для сброса кэша каталога после COMMIT. */
     private bool $catalogChanged = false;
 
+    /** Валюта магазина на время run(). */
+    private string $currency = '';
+
     /**
      * @param iterable<SourceClientInterface> $sources
-     * @param float $missingThreshold Доля активных экземпляров, выше которой пропавшие НЕ помечаются.
+     * @param float       $missingThreshold Доля активных экземпляров, выше которой пропавшие НЕ помечаются.
+     * @param string|null $shopCurrency     null — option uniundata_currency в начале каждого run().
      */
     public function __construct(
         private readonly Db $db,
@@ -93,10 +110,11 @@ final class SyncService
         private readonly MarcExtractor $extractor,
         iterable $sources,
         private readonly float $missingThreshold = self::MISSING_THRESHOLD,
+        private readonly ?string $shopCurrency = null,
     ) {
         foreach ($sources as $source) {
             $name = $source->name();
-            if (preg_match('/^[a-z0-9_-]{1,32}$/', $name) !== 1) {
+            if (preg_match('/' . self::SOURCE_NAME_PATTERN . '/', $name) !== 1) {
                 throw new \InvalidArgumentException(\sprintf('Invalid source name "%s"', $name));
             }
             $this->sources[$name] = $source;
@@ -126,7 +144,8 @@ final class SyncService
      *
      * @return array{run_id: int|null, status: string, continue: bool, message: string}
      *   status: succeeded | partial | failed | running (бюджет исчерпан, continue = true) |
-     *           locked (идёт другой процесс) | busy (живая цепочка другого запуска) | not_running | lock_lost
+     *           locked (идёт другой процесс) | busy (живая цепочка другого запуска) | not_running | lock_lost |
+     *           misconfigured (не задана валюта магазина)
      */
     public function run(
         string $sourceName,
@@ -140,11 +159,15 @@ final class SyncService
         if (!\in_array($triggeredBy, self::TRIGGERS, true)) {
             throw new \InvalidArgumentException(\sprintf('Invalid trigger "%s"', $triggeredBy));
         }
+        $this->currency = $this->shopCurrency ?? strtoupper(trim((string) get_option('uniundata_currency', '')));
+        if (preg_match('/^[A-Z]{3}$/', $this->currency) !== 1) {
+            return self::result(null, 'misconfigured', false, 'Option uniundata_currency (ISO 4217 shop currency) is not set');
+        }
         $deadline = $timeBudgetSeconds !== null ? microtime(true) + max(1.0, $timeBudgetSeconds) : null;
-        $lock = $this->lockName($sourceName);
+        $lock = self::lockKey($sourceName);
         $this->catalogChanged = false;
 
-        if (!$this->acquireLock($lock)) {
+        if (!$this->db->getLock($lock)) {
             return self::result(null, 'locked', false, 'Another process is syncing this source');
         }
 
@@ -158,7 +181,7 @@ final class SyncService
             }
             $runId = $open['run_id'];
 
-            return $this->process($client, $runId, $open['state'], $lock, $deadline, $allowMassMissing);
+            return $this->process($client, $runId, $open['pass'], $open['cursor'], $lock, $deadline, $allowMassMissing);
         } catch (\Throwable $e) {
             if ($e->getCode() === self::E_RUN_STOPPED) {
                 return self::result($runId, 'not_running', false, $e->getMessage());
@@ -171,7 +194,7 @@ final class SyncService
 
             return self::result($runId, 'failed', false, self::safeMessage($e));
         } finally {
-            $this->releaseLock($lock);
+            $this->db->releaseLock($lock);
             if ($this->catalogChanged) {
                 self::bumpCatalogVersion();
             }
@@ -186,8 +209,8 @@ final class SyncService
     public function recentRuns(?string $sourceName = null, int $limit = 10): array
     {
         $limit = max(1, min($limit, 100));
-        $cols = 'id, source_name, triggered_by, status, started_at, heartbeat_at, finished_at, '
-            . implode(', ', self::COUNTERS) . ', (status = \'running\' AND heartbeat_at < UTC_TIMESTAMP(6) - INTERVAL '
+        $cols = 'id, source_name, triggered_by, status, started_at, heartbeat_at, finished_at, resumed_from_run_id, '
+            . 'pass_started_run_id, ' . implode(', ', self::COUNTERS) . ', (status = \'running\' AND heartbeat_at < UTC_TIMESTAMP(6) - INTERVAL '
             . self::STALE_AFTER_SECONDS . ' SECOND) AS is_stale';
 
         return $sourceName === null
@@ -202,15 +225,16 @@ final class SyncService
 
     /**
      * Повторное извлечение полей из marc21_raw без обращения к источнику (изменились правила MarcExtractor).
-     * source_checksum не меняется: он считается от записи, а не от правил. Под той же блокировкой источника.
+     * source_checksum не меняется: он считается от записи, а не от правил. Под той же блокировкой источника;
+     * транзакции трогают только записи и производные таблицы (не экземпляры).
      *
      * @param (callable(int $done): void)|null $progress
      * @return int Сколько записей обновлено, или -1, если источник сейчас синхронизируется.
      */
     public function reextract(string $sourceName, ?callable $progress = null): int
     {
-        $lock = $this->lockName($sourceName);
-        if (!$this->acquireLock($lock)) {
+        $lock = self::lockKey($sourceName);
+        if (!$this->db->getLock($lock)) {
             return -1;
         }
         $done = 0;
@@ -241,7 +265,7 @@ final class SyncService
                 }
                 if ($extracted !== []) {
                     $this->db->transaction(function () use ($extracted): void {
-                        foreach ($extracted as $recordId => $x) {
+                        foreach ($extracted as $recordId => $x) { // ключи по возрастанию id
                             $this->updateRecordColumns($recordId, $x['record'], null);
                         }
                         $this->writeRecordLinks($extracted, true);
@@ -254,7 +278,7 @@ final class SyncService
                 }
             } while (\count($rows) === self::BATCH_SIZE);
         } finally {
-            $this->releaseLock($lock);
+            $this->db->releaseLock($lock);
             if ($this->catalogChanged) {
                 self::bumpCatalogVersion();
             }
@@ -269,9 +293,9 @@ final class SyncService
 
     /**
      * Вызывается под GET_LOCK. Решает: продолжить текущий running, пометить зависший aborted и начать
-     * новый (с его курсора), или выйти.
+     * новый (с его курсора и порога прохода), или выйти.
      *
-     * @return array{skip: ?string, run_id: ?int, state: array<string, mixed>}
+     * @return array{skip: ?string, run_id: ?int, pass: int, cursor: ?string}
      */
     private function openRun(string $source, string $triggeredBy, bool $resume, ?int $continueRunId): array
     {
@@ -279,7 +303,7 @@ final class SyncService
             $runs = $this->t('sync_runs');
             // Поиск по UNIQUE(running_source); FOR UPDATE — чтобы решение и INSERT/UPDATE были атомарны.
             $current = $this->db->getRow(
-                "SELECT id, status, source_cursor, heartbeat_at,
+                "SELECT id, status, source_cursor, pass_started_run_id, heartbeat_at,
                         (heartbeat_at < UTC_TIMESTAMP(6) - INTERVAL %d SECOND) AS is_stale
                    FROM {$runs} WHERE running_source = %s FOR UPDATE",
                 self::STALE_AFTER_SECONDS,
@@ -294,10 +318,10 @@ final class SyncService
                     // Тот же логический прогон продолжает процесс, который сейчас держит GET_LOCK.
                     $this->db->execute("UPDATE {$runs} SET heartbeat_at = UTC_TIMESTAMP(6) WHERE id = %d", $currentId);
 
-                    return ['skip' => null, 'run_id' => $currentId, 'state' => self::decodeState($current['source_cursor'], $currentId)];
+                    return ['skip' => null, 'run_id' => $currentId, 'pass' => (int) ($current['pass_started_run_id'] ?? $currentId), 'cursor' => $current['source_cursor']];
                 }
                 if ($current['is_stale'] !== '1') {
-                    return ['skip' => 'busy', 'run_id' => $currentId, 'state' => []];
+                    return ['skip' => 'busy', 'run_id' => $currentId, 'pass' => 0, 'cursor' => null];
                 }
                 // Зависший прогон: процесс умер (GET_LOCK мы получили), heartbeat старше 15 минут.
                 $log = self::appendErrors(null, [self::error(null, 'stale_heartbeat', 'No heartbeat since ' . $current['heartbeat_at'])]);
@@ -312,11 +336,11 @@ final class SyncService
                 ], 'sync');
                 $resumeFrom = $resume ? $current : null;
             } elseif ($continueRunId !== null) {
-                return ['skip' => 'not_running', 'run_id' => $continueRunId, 'state' => []];
+                return ['skip' => 'not_running', 'run_id' => $continueRunId, 'pass' => 0, 'cursor' => null];
             } elseif ($resume) {
                 // Последний прогон упал/был прерван недавно — продолжаем его проход, а не начинаем заново.
                 $last = $this->db->getRow(
-                    "SELECT id, status, source_cursor,
+                    "SELECT id, status, source_cursor, pass_started_run_id,
                             (started_at > UTC_TIMESTAMP(6) - INTERVAL %d HOUR) AS is_recent
                        FROM {$runs} WHERE source_name = %s ORDER BY started_at DESC, id DESC LIMIT 1",
                     self::RESUME_WINDOW_HOURS,
@@ -328,11 +352,11 @@ final class SyncService
                 }
             }
 
-            $cursor = null;
-            if ($resumeFrom !== null && $resumeFrom['source_cursor'] !== null) {
-                $state = self::decodeState($resumeFrom['source_cursor'], (int) $resumeFrom['id']);
-                $cursor = self::encodeState($state); // pass = первый прогон цепочки
+            // Продолжение — только если у прерванного прогона есть куда продолжать (курсор или «прочитано»).
+            if ($resumeFrom !== null && $resumeFrom['source_cursor'] === null) {
+                $resumeFrom = null;
             }
+            $cursor = $resumeFrom !== null ? (string) $resumeFrom['source_cursor'] : null;
 
             try {
                 $runId = $this->db->insert('sync_runs', [
@@ -340,30 +364,47 @@ final class SyncService
                     'triggered_by' => $triggeredBy,
                     'status' => 'running',
                     'source_cursor' => $cursor,
+                    'resumed_from_run_id' => $resumeFrom !== null ? (int) $resumeFrom['id'] : null,
+                    'pass_started_run_id' => $resumeFrom !== null
+                        ? (int) ($resumeFrom['pass_started_run_id'] ?? $resumeFrom['id'])
+                        : null,
                 ], ['started_at', 'heartbeat_at']);
             } catch (\mysqli_sql_exception $e) {
                 if ($this->db->isDuplicateKey('uq_sync_runs_one_running', $e)) {
-                    return ['skip' => 'busy', 'run_id' => null, 'state' => []];
+                    return ['skip' => 'busy', 'run_id' => null, 'pass' => 0, 'cursor' => null];
                 }
                 throw $e;
+            }
+            $pass = $resumeFrom !== null ? (int) ($resumeFrom['pass_started_run_id'] ?? $resumeFrom['id']) : $runId;
+            if ($resumeFrom === null) {
+                // Новый проход начинается этим прогоном.
+                $this->db->execute("UPDATE {$runs} SET pass_started_run_id = id WHERE id = %d", $runId);
             }
             $this->audit->record('sync.run_started', 'sync_run', $runId, null, 'running', [
                 'source' => $source,
                 'triggered_by' => $triggeredBy,
                 'resumed_from_run_id' => $resumeFrom !== null ? (int) $resumeFrom['id'] : null,
+                'pass_started_run_id' => $pass,
             ], 'sync');
 
-            return ['skip' => null, 'run_id' => $runId, 'state' => self::decodeState($cursor, $runId)];
+            return ['skip' => null, 'run_id' => $runId, 'pass' => $pass, 'cursor' => $cursor];
         });
     }
 
     /**
-     * @param array{pass: int, cursor: ?string, incremental: bool, end: bool, missing: ?string} $state
+     * Чтение источника страницами, затем проход «пропавших».
+     *
+     * Признак «полный снимок» берётся со страниц (SourceBatch::$fullSnapshot одинаков в пределах прохода).
+     * Последняя страница полного прохода записывает source_cursor = '' (дальше — проход «пропавших», даже
+     * если он займёт несколько шагов); последняя страница инкрементальной выгрузки — NULL, и прогон
+     * закрывается сразу: продолжать после сбоя нечего, а помечать пропавшие по неполному набору нельзя.
+     *
      * @return array{run_id: int|null, status: string, continue: bool, message: string}
      */
-    private function process(SourceClientInterface $client, int $runId, array $state, string $lock, ?float $deadline, bool $allowMassMissing): array
+    private function process(SourceClientInterface $client, int $runId, int $pass, ?string $cursor, string $lock, ?float $deadline, bool $allowMassMissing): array
     {
-        while (!$state['end']) {
+        $incremental = false;
+        while ($cursor !== self::CURSOR_READ_DONE) {
             if (!$this->holdsLock($lock)) {
                 // $wpdb переподключился — блокировка потеряна. Прогон остаётся running без heartbeat:
                 // его подхватит следующий запуск (через 15 минут — aborted + resume).
@@ -375,92 +416,93 @@ final class SyncService
                 return self::result($runId, 'running', true, 'Time budget exhausted; continue with the next step');
             }
 
-            $batch = $this->fetchWithRetry($client, $state['cursor']);
-            $next = $state;
-            $next['cursor'] = $batch->isLast ? null : $batch->nextCursor;
-            $next['incremental'] = $state['incremental'] || !$batch->fullSnapshot;
-            $next['end'] = $batch->isLast;
-
-            $this->applyBatch($runId, $client->name(), $batch, self::encodeState($next));
-            $state = $next;
+            $batch = $this->fetchWithRetry($client, $cursor);
+            $incremental = $incremental || !$batch->fullSnapshot;
+            $next = match (true) {
+                !$batch->isLast => $batch->nextCursor,
+                $incremental => null,
+                default => self::CURSOR_READ_DONE,
+            };
+            $this->applyBatch($runId, $client->name(), $batch, $next);
             $this->freeMemory();
+            if ($batch->isLast && $incremental) {
+                return $this->closeRun($runId, 'skipped');
+            }
+            $cursor = $next;
         }
 
-        return $this->finalize($runId, $client->name(), $state, $lock, $deadline, $allowMassMissing);
+        return $this->finalize($runId, $client->name(), $pass, $lock, $deadline, $allowMassMissing);
     }
 
     /**
-     * Проход «пропавших» и закрытие прогона.
+     * Проход «пропавших» и закрытие прогона. Повторный вход (следующий шаг, resume после сбоя) пересчитывает
+     * порог: уже помеченные экземпляры выбывают и из кандидатов, и из активных, поэтому одобренный проход
+     * остаётся одобренным, а «блокированный» прогон закрывается в том же шаге.
      *
-     * @param array{pass: int, cursor: ?string, incremental: bool, end: bool, missing: ?string} $state
      * @return array{run_id: int|null, status: string, continue: bool, message: string}
      */
-    private function finalize(int $runId, string $source, array $state, string $lock, ?float $deadline, bool $allowMassMissing): array
+    private function finalize(int $runId, string $source, int $pass, string $lock, ?float $deadline, bool $allowMassMissing): array
     {
-        $alert = null;
-
-        if ($state['incremental']) {
-            $state['missing'] = 'skipped'; // неполный набор: пометка пропавших невозможна по определению
-        }
-
-        if ($state['missing'] === null) {
-            [$active, $candidates] = $this->missingCounts($source, $state['pass']);
-            $exceeded = $active > 0 && $candidates > $this->missingThreshold * $active;
-            $state['missing'] = $exceeded && !$allowMassMissing ? 'blocked' : 'approved';
-            $errors = [];
-            if ($state['missing'] === 'blocked') {
-                $errors[] = self::error(null, 'missing_threshold_exceeded', \sprintf(
+        [$active, $candidates] = $this->missingCounts($source, $pass);
+        if ($active > 0 && $candidates > $this->missingThreshold * $active && !$allowMassMissing) {
+            $this->db->transaction(function () use ($runId, $candidates, $active): void {
+                $run = $this->lockRun($runId);
+                $this->updateRun($runId, [], [self::error(null, 'missing_threshold_exceeded', \sprintf(
                     '%d of %d active items are absent (> %d%%); sync_missing NOT applied',
                     $candidates,
                     $active,
                     (int) round($this->missingThreshold * 100),
-                ));
-            }
-            // Решение фиксируется в курсоре: повторный вход (бюджет, сбой) не пересчитывает порог по уже
-            // частично помеченному каталогу.
-            $this->db->transaction(function () use ($runId, $state, $errors): void {
-                $run = $this->lockRun($runId);
-                $this->updateRun($runId, [], $errors, self::encodeState($state), $run['error_log']);
+                ))], $run['error_log']);
             });
+            $result = $this->closeRun($runId, 'blocked');
+            $this->enqueue(self::HOOK_ALERT, ['run_id' => $runId, 'code' => 'missing_threshold_exceeded']);
+
+            return $result;
         }
 
-        if ($state['missing'] === 'approved') {
-            $lastId = 0;
-            while (true) {
-                if (!$this->holdsLock($lock)) {
-                    return self::result($runId, 'lock_lost', false, 'GET_LOCK was lost (reconnect?)');
-                }
-                if ($deadline !== null && microtime(true) >= $deadline) {
-                    $this->heartbeat($runId);
-
-                    return self::result($runId, 'running', true, 'Time budget exhausted during the missing pass');
-                }
-                // Кандидаты — обычным чтением (ix_items_sync), решение — под FOR UPDATE ниже.
-                $ids = array_map('intval', array_column($this->db->getResults(
-                    "SELECT id FROM {$this->t('items')}
-                      WHERE source_name = %s
-                        AND (last_seen_sync_run_id IS NULL OR last_seen_sync_run_id < %d)
-                        AND source_status = 'present' AND availability_status <> 'sold'
-                        AND external_item_id IS NOT NULL
-                        AND id > %d
-                      ORDER BY id LIMIT %d",
-                    $source,
-                    $state['pass'],
-                    $lastId,
-                    self::BATCH_SIZE,
-                ), 'id'));
-                if ($ids === []) {
-                    break;
-                }
-                $lastId = max($ids);
-                $this->db->transaction(fn () => $this->markMissingLocked($runId, $source, $state['pass'], $ids));
+        $lastId = 0;
+        while (true) {
+            if (!$this->holdsLock($lock)) {
+                return self::result($runId, 'lock_lost', false, 'GET_LOCK was lost (reconnect?)');
             }
+            if ($deadline !== null && microtime(true) >= $deadline) {
+                $this->heartbeat($runId);
+
+                return self::result($runId, 'running', true, 'Time budget exhausted during the missing pass');
+            }
+            // Кандидаты — обычным чтением (ix_items_sync), решение — под FOR UPDATE ниже.
+            $ids = array_map('intval', array_column($this->db->getResults(
+                "SELECT id FROM {$this->t('items')}
+                  WHERE source_name = %s
+                    AND (last_seen_sync_run_id IS NULL OR last_seen_sync_run_id < %d)
+                    AND source_status = 'present' AND availability_status <> 'sold'
+                    AND external_item_id IS NOT NULL
+                    AND id > %d
+                  ORDER BY id LIMIT %d",
+                $source,
+                $pass,
+                $lastId,
+                self::BATCH_SIZE,
+            ), 'id'));
+            if ($ids === []) {
+                break;
+            }
+            $lastId = max($ids);
+            $this->db->transaction(fn () => $this->markMissingLocked($runId, $source, $pass, $ids));
         }
 
-        // Закрытие прогона.
-        $final = $this->db->transaction(function () use ($runId, $state, &$alert): string {
+        return $this->closeRun($runId, 'approved');
+    }
+
+    /**
+     * @param 'approved'|'blocked'|'skipped' $missingPass
+     * @return array{run_id: int|null, status: string, continue: bool, message: string}
+     */
+    private function closeRun(int $runId, string $missingPass): array
+    {
+        $final = $this->db->transaction(function () use ($runId, $missingPass): string {
             $run = $this->lockRun($runId);
-            $status = $state['missing'] === 'blocked' || (int) $run['errors_count'] > 0 ? 'partial' : 'succeeded';
+            $status = $missingPass === 'blocked' || (int) $run['errors_count'] > 0 ? 'partial' : 'succeeded';
             $this->db->execute(
                 "UPDATE {$this->t('sync_runs')}
                     SET status = %s, finished_at = UTC_TIMESTAMP(6), heartbeat_at = UTC_TIMESTAMP(6)
@@ -469,23 +511,17 @@ final class SyncService
                 $runId,
             );
             $this->audit->record('sync.run_finished', 'sync_run', $runId, 'running', $status, [
-                'missing_pass' => $state['missing'],
-                'pass_started_run_id' => $state['pass'],
+                'missing_pass' => $missingPass,
             ], 'sync');
-            if ($state['missing'] === 'blocked') {
-                $alert = 'missing_threshold_exceeded';
-            }
 
             return $status;
         });
 
-        if ($alert !== null) {
-            $this->enqueue(self::HOOK_ALERT, ['run_id' => $runId, 'code' => $alert]);
-        }
-
-        return self::result($runId, $final, false, $state['missing'] === 'blocked'
-            ? 'Too many items disappeared from the source; sync_missing was not applied'
-            : 'Done');
+        return self::result($runId, $final, false, match ($missingPass) {
+            'blocked' => 'Too many items disappeared from the source; sync_missing was not applied',
+            'skipped' => 'Done (incremental export: missing items are not detected)',
+            default => 'Done',
+        });
     }
 
     /** @return array{0: int, 1: int} [активные экземпляры источника, кандидаты в пропавшие] */
@@ -559,28 +595,59 @@ final class SyncService
             $this->catalogChanged = true;
         }
 
-        $this->updateRun($runId, $c, [], null, $run['error_log']);
+        $this->updateRun($runId, $c, [], $run['error_log']);
     }
 
     // =============================================================================================
     // Пакет
     // =============================================================================================
 
-    private function applyBatch(int $runId, string $source, SourceBatch $batch, string $cursorState): void
+    /**
+     * Пакет: разбор (CPU) → транзакция записей → транзакция экземпляров (с курсором). Ошибка данных в одной
+     * записи (1062/1366/3819…) не срывает пакет: фаза повторяется по одной сущности в транзакции.
+     *
+     * @param string|null $nextCursor Что записать в source_cursor вместе с экземплярами пакета.
+     */
+    private function applyBatch(int $runId, string $source, SourceBatch $batch, ?string $nextCursor): void
     {
         $errors = [];
-        $touchIds = [];
+        $touchIds = []; // есть в источнике, но не обрабатываются — только last_seen (не считать пропавшими)
+        $skipped = 0;
         foreach ($batch->rejected as $r) {
             $errors[] = self::error($r['external_item_id'], $r['code'], $r['message']);
             if ($r['external_item_id'] !== null) {
-                $touchIds[] = $r['external_item_id']; // экземпляр в источнике есть — не считать пропавшим
+                $touchIds[] = $r['external_item_id'];
             }
         }
 
-        // Разбор MARC и checksum — до транзакции (только CPU).
+        // Существующие экземпляры — обычным чтением: создаёт их только синхронизация этого источника под GET_LOCK.
+        $extIds = array_values(array_unique(array_map(static fn (array $e): string => $e['external_item_id'], $batch->entries)));
+        $existing = [];
+        if ($extIds !== []) {
+            foreach ($this->db->getResults(
+                "SELECT external_item_id FROM {$this->t('items')}
+                  WHERE source_name = %s AND external_item_id IN ({$this->db->placeholders(\count($extIds), '%s')})",
+                $source,
+                ...$extIds,
+            ) as $row) {
+                $existing[(string) $row['external_item_id']] = true;
+            }
+        }
+
+        // Разбор MARC и checksum — до транзакций (только CPU).
         $prepared = [];
         foreach ($batch->entries as $entry) {
             $ext = $entry['external_item_id'];
+            if ($entry['currency'] !== $this->currency) {
+                $errors[] = self::error($ext, 'currency_mismatch', \sprintf('Item currency %s differs from the shop currency %s; skipped', $entry['currency'], $this->currency));
+                $touchIds[] = $ext;
+                ++$skipped;
+                continue;
+            }
+            if (!isset($existing[$ext]) && $entry['status'] === 'withdrawn') {
+                ++$skipped; // новые снятые экземпляры не заводим: в продаже их не было и не будет
+                continue;
+            }
             try {
                 $in = $this->extractor->normalizeInput($entry['marc'], $entry['marc_format']);
                 $extracted = $this->extractor->extract($in['record']);
@@ -604,102 +671,9 @@ final class SyncService
             }
         }
 
-        try {
-            $this->db->transaction(fn () => $this->writeBatch(
-                $runId, $source, array_values($prepared), $touchIds, $errors, $cursorState, $batch->receivedCount,
-            ));
-
-            return;
-        } catch (\Throwable $e) {
-            if (self::isInfrastructureError($e)) {
-                throw $e; // deadlock после повторов, потеря соединения, прогон остановлен: пакет повторит следующий запуск
-            }
-            // Ошибка данных в одной записи (1062/1366/3819…): изолируем её — по транзакции на запись.
-            error_log(\sprintf('[uniundata] sync batch fallback to per-entry mode: %s', self::safeMessage($e)));
-        }
-
-        foreach ($prepared as $ext => $p) {
-            try {
-                $this->db->transaction(fn () => $this->writeBatch($runId, $source, [$p], [], [], null, 0));
-            } catch (\Throwable $e) {
-                if (self::isInfrastructureError($e)) {
-                    throw $e;
-                }
-                $errors[] = self::error((string) $ext, 'write_failed', self::safeMessage($e));
-                $touchIds[] = (string) $ext;
-            }
-        }
-        // Курсор, records_received и ошибки — одной финальной транзакцией.
-        $this->db->transaction(fn () => $this->writeBatch(
-            $runId, $source, [], $touchIds, $errors, $cursorState, $batch->receivedCount,
-        ));
-    }
-
-    /**
-     * Транзакция пакета. Все решения — по строкам, прочитанным FOR UPDATE.
-     *
-     * @param list<array{entry: array<string, mixed>, input: array<string, mixed>, extracted: array<string, mixed>,
-     *                   record_checksum: string, item_checksum: string}> $prepared
-     * @param list<string>                $touchExternalIds Есть в источнике, но не обработаны (ошибка) — только last_seen.
-     * @param list<array<string, mixed>>  $errors
-     */
-    private function writeBatch(
-        int $runId,
-        string $source,
-        array $prepared,
-        array $touchExternalIds,
-        array $errors,
-        ?string $cursorState,
-        int $received,
-    ): void {
-        $run = $this->lockRun($runId);
-        $now = $this->db->now();
-        $c = self::zeroCounters();
-        $c['records_received'] = $received;
-
-        // --- Существующие экземпляры: ID обычным чтением, затем FOR UPDATE по возрастанию id -------
-        $extIds = array_values(array_unique(array_merge(
-            array_map(static fn (array $p): string => $p['entry']['external_item_id'], $prepared),
-            $touchExternalIds,
-        )));
-        $items = []; // external_item_id → строка под блокировкой
-        if ($extIds !== []) {
-            $idRows = $this->db->getResults(
-                "SELECT id FROM {$this->t('items')}
-                  WHERE source_name = %s AND external_item_id IN ({$this->db->placeholders(\count($extIds), '%s')})",
-                $source,
-                ...$extIds,
-            );
-            $ids = array_map('intval', array_column($idRows, 'id'));
-            sort($ids);
-            if ($ids !== []) {
-                foreach ($this->db->getResults(
-                    "SELECT id, book_record_id, external_item_id, availability_status, source_status, source_checksum
-                       FROM {$this->t('items')}
-                      WHERE id IN ({$this->db->placeholders(\count($ids))})
-                      ORDER BY id
-                        FOR UPDATE",
-                    ...$ids,
-                ) as $row) {
-                    $items[(string) $row['external_item_id']] = $row;
-                }
-            }
-        }
-
-        // Новые экземпляры со статусом withdrawn не заводим: в продаже их не было и не будет.
-        $work = [];
-        foreach ($prepared as $p) {
-            if (!isset($items[$p['entry']['external_item_id']]) && $p['entry']['status'] === 'withdrawn') {
-                ++$c['items_skipped'];
-                continue;
-            }
-            $work[] = $p;
-        }
-        $work = $this->resolveInventoryConflicts($work, $items, $errors);
-
-        // --- Записи: существующие (обычное чтение: пишет их только синхронизация этого источника) ---
+        // --- A. Записи ---------------------------------------------------------------------------------
         $byRecord = [];
-        foreach ($work as $p) {
+        foreach ($prepared as $p) {
             $rid = $p['entry']['source_record_id'];
             if (!isset($byRecord[$rid])) {
                 $byRecord[$rid] = $p;
@@ -708,20 +682,97 @@ final class SyncService
                     'Items of one source_record_id carry different MARC; the first one is used');
             }
         }
-        $records = []; // source_record_id → ['id' => int, 'source_checksum' => string]
+        $recordIds = []; // source_record_id → wp_book_records.id
         if ($byRecord !== []) {
-            $rids = array_map('strval', array_keys($byRecord));
-            foreach ($this->db->getResults(
-                "SELECT id, source_record_id, source_checksum FROM {$this->t('records')}
-                  WHERE source_name = %s AND source_record_id IN ({$this->db->placeholders(\count($rids), '%s')})",
-                $source,
-                ...$rids,
-            ) as $row) {
-                $records[(string) $row['source_record_id']] = ['id' => (int) $row['id'], 'source_checksum' => (string) $row['source_checksum']];
+            try {
+                $recordIds = $this->db->transaction(fn (): array => $this->writeRecords($runId, $source, $byRecord));
+            } catch (\Throwable $e) {
+                if (self::isInfrastructureError($e)) {
+                    throw $e; // deadlock после повторов, потеря соединения, прогон остановлен: пакет повторит следующий запуск
+                }
+                error_log(\sprintf('[uniundata] sync records fallback to per-record mode: %s', self::safeMessage($e)));
+                foreach ($byRecord as $rid => $p) {
+                    try {
+                        $recordIds += $this->db->transaction(fn (): array => $this->writeRecords($runId, $source, [$rid => $p]));
+                    } catch (\Throwable $e2) {
+                        if (self::isInfrastructureError($e2)) {
+                            throw $e2;
+                        }
+                        $errors[] = self::error((string) $rid, 'record_write_failed', self::safeMessage($e2));
+                    }
+                }
             }
         }
 
-        // --- Новые записи: multi-row INSERT, затем ID по UNIQUE(source_name, source_record_id) ---------
+        // Экземпляры, чья запись не записалась, только отмечаются как «есть в источнике».
+        $work = [];
+        foreach ($prepared as $ext => $p) {
+            $p['record_id'] = $recordIds[$p['entry']['source_record_id']] ?? null;
+            if ($p['record_id'] === null) {
+                $touchIds[] = (string) $ext;
+                continue;
+            }
+            $work[] = $p;
+        }
+
+        // --- B. Экземпляры (+ курсор, счётчики, ошибки) ------------------------------------------------
+        try {
+            $this->db->transaction(fn () => $this->writeItems(
+                $runId, $source, $work, $touchIds, $errors, $skipped, true, $nextCursor, $batch->receivedCount,
+            ));
+
+            return;
+        } catch (\Throwable $e) {
+            if (self::isInfrastructureError($e)) {
+                throw $e;
+            }
+            error_log(\sprintf('[uniundata] sync items fallback to per-item mode: %s', self::safeMessage($e)));
+        }
+
+        foreach ($work as $p) {
+            try {
+                $this->db->transaction(fn () => $this->writeItems($runId, $source, [$p], [], [], 0, false, null, 0));
+            } catch (\Throwable $e) {
+                if (self::isInfrastructureError($e)) {
+                    throw $e;
+                }
+                $errors[] = self::error($p['entry']['external_item_id'], 'item_write_failed', self::safeMessage($e));
+                $touchIds[] = $p['entry']['external_item_id'];
+            }
+        }
+        // Курсор, records_received и ошибки — одной финальной транзакцией.
+        $this->db->transaction(fn () => $this->writeItems(
+            $runId, $source, [], $touchIds, $errors, $skipped, true, $nextCursor, $batch->receivedCount,
+        ));
+    }
+
+    /**
+     * Транзакция A: записи пакета. Блокировки: строка прогона → существующие записи FOR UPDATE по возрастанию
+     * id → новые записи → производные таблицы. Экземпляры не трогаются.
+     *
+     * @param array<string, array<string, mixed>> $byRecord source_record_id → подготовленная запись
+     * @return array<string, int> source_record_id → id
+     */
+    private function writeRecords(int $runId, string $source, array $byRecord): array
+    {
+        $run = $this->lockRun($runId);
+        $now = $this->db->now();
+        $c = self::zeroCounters();
+        $rids = array_map('strval', array_keys($byRecord));
+
+        $records = []; // source_record_id → ['id' => int, 'source_checksum' => string]
+        foreach ($this->db->getResults(
+            "SELECT id, source_record_id, source_checksum FROM {$this->t('records')}
+              WHERE source_name = %s AND source_record_id IN ({$this->db->placeholders(\count($rids), '%s')})
+              ORDER BY id
+                FOR UPDATE",
+            $source,
+            ...$rids,
+        ) as $row) {
+            $records[(string) $row['source_record_id']] = ['id' => (int) $row['id'], 'source_checksum' => (string) $row['source_checksum']];
+        }
+
+        // Новые записи: multi-row INSERT, затем ID по UNIQUE(source_name, source_record_id).
         $linkSets = []; // record_id → extracted (для identifiers/contributors/subjects)
         $newRecords = array_diff_key($byRecord, $records);
         if ($newRecords !== []) {
@@ -737,12 +788,12 @@ final class SyncService
                 );
             }
             $this->insertRows('records', $columns, $rows);
-            $rids = array_map('strval', array_keys($newRecords));
+            $newIds = array_map('strval', array_keys($newRecords));
             foreach ($this->db->getResults(
                 "SELECT id, source_record_id FROM {$this->t('records')}
-                  WHERE source_name = %s AND source_record_id IN ({$this->db->placeholders(\count($rids), '%s')})",
+                  WHERE source_name = %s AND source_record_id IN ({$this->db->placeholders(\count($newIds), '%s')})",
                 $source,
-                ...$rids,
+                ...$newIds,
             ) as $row) {
                 $records[(string) $row['source_record_id']] = ['id' => (int) $row['id'], 'source_checksum' => '-new-'];
                 $linkSets[(int) $row['id']] = $newRecords[(string) $row['source_record_id']]['extracted'];
@@ -750,15 +801,114 @@ final class SyncService
             $c['records_created'] += \count($newRecords);
         }
 
-        // --- Экземпляры ---------------------------------------------------------------------------
+        // Существующие: UPDATE изменённых по возрастанию id, touch неизменённых.
+        uasort($records, static fn (array $a, array $b): int => $a['id'] <=> $b['id']);
+        $touchRecordIds = [];
+        foreach ($records as $rid => $rec) {
+            $p = $byRecord[$rid];
+            if ($rec['source_checksum'] === '-new-') {
+                continue;
+            }
+            if ($rec['source_checksum'] === $p['record_checksum']) {
+                $touchRecordIds[] = $rec['id'];
+                ++$c['records_skipped'];
+                continue;
+            }
+            $this->updateRecordColumns($rec['id'], $p['extracted']['record'], [
+                'source_format' => $p['input']['source_format'],
+                'marc21_format' => $p['input']['marc21_format'],
+                'marc21_raw' => $p['input']['marc21_raw'],
+                'source_checksum' => $p['record_checksum'],
+                'last_seen_sync_run_id' => $runId,
+                'last_synced_at' => $now,
+            ]);
+            $linkSets[$rec['id']] = $p['extracted'];
+            ++$c['records_updated'];
+        }
+        if ($touchRecordIds !== []) {
+            $this->db->execute(
+                "UPDATE {$this->t('records')} SET last_seen_sync_run_id = %d, last_synced_at = %s
+                  WHERE id IN ({$this->db->placeholders(\count($touchRecordIds))})",
+                $runId,
+                $now,
+                ...$touchRecordIds,
+            );
+        }
+        if ($linkSets !== []) {
+            $this->writeRecordLinks($linkSets, $c['records_updated'] > 0);
+            $this->catalogChanged = true;
+        }
+
+        $this->updateRun($runId, $c, [], $run['error_log']);
+
+        return array_map(static fn (array $r): int => $r['id'], $records);
+    }
+
+    /**
+     * Транзакция B: экземпляры пакета. Все решения — по строкам, прочитанным FOR UPDATE.
+     *
+     * @param list<array<string, mixed>>  $work            Подготовленные записи с record_id.
+     * @param list<string>                $touchExternalIds Есть в источнике, но не обработаны — только last_seen.
+     * @param list<array<string, mixed>>  $errors
+     */
+    private function writeItems(
+        int $runId,
+        string $source,
+        array $work,
+        array $touchExternalIds,
+        array $errors,
+        int $skipped,
+        bool $setCursor,
+        ?string $cursor,
+        int $received,
+    ): void {
+        $run = $this->lockRun($runId);
+        $now = $this->db->now();
+        $c = self::zeroCounters();
+        $c['records_received'] = $received;
+        $c['items_skipped'] = $skipped;
+
+        // --- Существующие экземпляры: ID обычным чтением, затем FOR UPDATE по возрастанию id -------
+        $extIds = array_values(array_unique(array_merge(
+            array_map(static fn (array $p): string => $p['entry']['external_item_id'], $work),
+            $touchExternalIds,
+        )));
+        $items = []; // external_item_id → строка под блокировкой
+        if ($extIds !== []) {
+            $ids = array_map('intval', array_column($this->db->getResults(
+                "SELECT id FROM {$this->t('items')}
+                  WHERE source_name = %s AND external_item_id IN ({$this->db->placeholders(\count($extIds), '%s')})",
+                $source,
+                ...$extIds,
+            ), 'id'));
+            sort($ids);
+            if ($ids !== []) {
+                foreach ($this->db->getResults(
+                    "SELECT id, book_record_id, external_item_id, availability_status, source_status, source_checksum
+                       FROM {$this->t('items')}
+                      WHERE id IN ({$this->db->placeholders(\count($ids))})
+                      ORDER BY id
+                        FOR UPDATE",
+                    ...$ids,
+                ) as $row) {
+                    $items[(string) $row['external_item_id']] = $row;
+                }
+            }
+        }
+        $work = $this->resolveInventoryConflicts($work, $items, $errors);
+
         $newItems = [];
         $touchItemIds = [];
         foreach ($work as $p) {
             $e = $p['entry'];
             $item = $items[$e['external_item_id']] ?? null;
             if ($item === null) {
+                if ($e['status'] === 'withdrawn') {
+                    ++$c['items_skipped'];
+                    continue;
+                }
                 $newItems[] = [
-                    $records[$e['source_record_id']]['id'], $source, $e['external_item_id'], $e['inventory_number'],
+                    $p['record_id'], $source, $e['external_item_id'], $e['inventory_number'],
                     $e['price_amount'], $e['currency'], $e['condition_code'], $e['condition_note'], $e['cover_url'],
                     $e['source_url'], 'available', $now, 1, 'present', $p['item_checksum'], $runId, $now,
                 ];
@@ -781,6 +931,7 @@ final class SyncService
         }
         if ($touchItemIds !== []) {
             $touchItemIds = array_values(array_unique($touchItemIds));
+            sort($touchItemIds);
             $this->db->execute(
                 "UPDATE {$this->t('items')} SET last_seen_sync_run_id = %d, last_synced_at = %s
                   WHERE id IN ({$this->db->placeholders(\count($touchItemIds))})",
@@ -790,46 +941,8 @@ final class SyncService
             );
         }
 
-        // --- Существующие записи: UPDATE изменённых (после экземпляров), touch неизменённых -------------
-        $touchRecordIds = [];
-        foreach ($byRecord as $rid => $p) {
-            $rec = $records[(string) $rid];
-            if ($rec['source_checksum'] === '-new-') {
-                continue;
-            }
-            if ($rec['source_checksum'] === $p['record_checksum']) {
-                $touchRecordIds[] = $rec['id'];
-                ++$c['records_skipped'];
-                continue;
-            }
-            $this->updateRecordColumns($rec['id'], $p['extracted']['record'], [
-                'source_format' => $p['input']['source_format'],
-                'marc21_format' => $p['input']['marc21_format'],
-                'marc21_raw' => $p['input']['marc21_raw'],
-                'source_checksum' => $p['record_checksum'],
-                'last_seen_sync_run_id' => $runId,
-                'last_synced_at' => $now,
-            ]);
-            $linkSets[$rec['id']] = $p['extracted'];
-            ++$c['records_updated'];
-        }
-        if ($touchRecordIds !== []) {
-            sort($touchRecordIds);
-            $this->db->execute(
-                "UPDATE {$this->t('records')} SET last_seen_sync_run_id = %d, last_synced_at = %s
-                  WHERE id IN ({$this->db->placeholders(\count($touchRecordIds))})",
-                $runId,
-                $now,
-                ...$touchRecordIds,
-            );
-        }
-        if ($linkSets !== []) {
-            $this->writeRecordLinks($linkSets, $c['records_updated'] > 0);
-            $this->catalogChanged = true;
-        }
-
-        $this->updateRun($runId, $c, $errors, $cursorState, $run['error_log']);
-        if ($c['records_created'] + $c['records_updated'] + $c['items_created'] + $c['items_updated'] > 0) {
+        $this->updateRun($runId, $c, $errors, $run['error_log'], $setCursor, $cursor);
+        if ($c['items_created'] + $c['items_updated'] > 0) {
             $this->audit->record('sync.batch_applied', 'sync_run', $runId, null, null, array_filter($c), 'sync');
         }
     }
@@ -1158,8 +1271,9 @@ final class SyncService
      *
      * @param array<string, int>          $c
      * @param list<array<string, mixed>>  $errors
+     * @param bool                        $setCursor false — source_cursor не трогать.
      */
-    private function updateRun(int $runId, array $c, array $errors, ?string $cursorState, ?string $currentLog): void
+    private function updateRun(int $runId, array $c, array $errors, ?string $currentLog, bool $setCursor = false, ?string $cursor = null): void
     {
         $c['errors_count'] = ($c['errors_count'] ?? 0) + \count(array_filter($errors, static fn (array $e): bool => $e['counted']));
         $sets = ['heartbeat_at = UTC_TIMESTAMP(6)'];
@@ -1170,9 +1284,13 @@ final class SyncService
                 $args[] = $c[$col];
             }
         }
-        if ($cursorState !== null) {
-            $sets[] = 'source_cursor = %s';
-            $args[] = $cursorState;
+        if ($setCursor) {
+            if ($cursor === null) {
+                $sets[] = 'source_cursor = NULL';
+            } else {
+                $sets[] = 'source_cursor = %s';
+                $args[] = $cursor;
+            }
         }
         if ($errors !== []) {
             $sets[] = 'error_log = %s';
@@ -1235,31 +1353,15 @@ final class SyncService
         }
     }
 
-    /** Имена GET_LOCK общие для всего сервера MySQL — добавляем отпечаток БД и префикса (≤ 64 символов). */
-    private function lockName(string $source): string
+    /** Короткое имя для Db::getLock()/lockName(): 'sync_' + источник (≤ 37 символов). */
+    private static function lockKey(string $source): string
     {
-        $wpdb = $this->db->wpdb();
-
-        return 'uniundata_sync_' . $source . '@' . substr(md5((string) $wpdb->dbname . '|' . $wpdb->prefix), 0, 8);
+        return 'sync_' . $source;
     }
 
-    private function acquireLock(string $name): bool
+    private function holdsLock(string $key): bool
     {
-        return $this->db->getVar('SELECT GET_LOCK(%s, 0)', $name) === '1';
-    }
-
-    private function holdsLock(string $name): bool
-    {
-        return $this->db->getVar('SELECT IS_USED_LOCK(%s) = CONNECTION_ID()', $name) === '1';
-    }
-
-    private function releaseLock(string $name): void
-    {
-        try {
-            $this->db->getVar('SELECT RELEASE_LOCK(%s)', $name);
-        } catch (\Throwable) {
-            // Соединение потеряно — сервер уже снял блокировку.
-        }
+        return $this->db->getVar('SELECT IS_USED_LOCK(%s) = CONNECTION_ID()', $this->db->lockName($key)) === '1';
     }
 
     /**
@@ -1364,38 +1466,6 @@ final class SyncService
         ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR));
     }
 
-    /**
-     * Состояние прохода в source_cursor (VARCHAR(255)): "v1|p=<pass>|i=<0|1>|e=<0|1>|m=<->|c=<cursor>".
-     *   p — id первого прогона цепочки (порог last_seen_sync_run_id для прохода «пропавших»);
-     *   i — в проходе была инкрементальная страница; e — набор получен полностью;
-     *   m — решение по порогу missing (approved | blocked | skipped | -); c — курсор источника (последним:
-     *   он печатный ASCII ≤ 200 и может содержать «|»).
-     *
-     * @param array{pass: int, cursor: ?string, incremental: bool, end: bool, missing: ?string} $s
-     */
-    private static function encodeState(array $s): string
-    {
-        return \sprintf('v1|p=%d|i=%d|e=%d|m=%s|c=%s', $s['pass'], $s['incremental'] ? 1 : 0, $s['end'] ? 1 : 0,
-            $s['missing'] ?? '-', $s['cursor'] ?? '');
-    }
-
-    /** @return array{pass: int, cursor: ?string, incremental: bool, end: bool, missing: ?string} */
-    private static function decodeState(?string $raw, int $runId): array
-    {
-        if ($raw !== null && preg_match('/^v1\|p=(\d+)\|i=([01])\|e=([01])\|m=([a-z-]+)\|c=(.*)$/s', $raw, $m) === 1) {
-            return [
-                'pass' => (int) $m[1],
-                'cursor' => $m[5] === '' ? null : $m[5],
-                'incremental' => $m[2] === '1',
-                'end' => $m[3] === '1',
-                'missing' => $m[4] === '-' ? null : $m[4],
-            ];
-        }
-
-        // Пусто (новый прогон) или «сырой» курсор старого формата.
-        return ['pass' => $runId, 'cursor' => $raw !== null && $raw !== '' ? $raw : null, 'incremental' => false, 'end' => false, 'missing' => null];
-    }
-
     /** @return array<string, int> */
     private static function zeroCounters(): array
     {
@@ -1415,7 +1485,7 @@ final class SyncService
     }
 
     /**
-     * Не более MAX_ERROR_LOG последних записей. JSON без JSON_UNESCAPED_UNICODE: запрос остаётся ASCII.
+     * Не более MAX_ERROR_LOG последних записей; битый UTF-8 из источника заменяется (JSON_INVALID_UTF8_SUBSTITUTE).
      *
      * @param list<array<string, mixed>> $new
      */
@@ -1448,7 +1518,7 @@ final class SyncService
         }
         for ($x = $e; $x !== null; $x = $x->getPrevious()) {
             if ($x instanceof \mysqli_sql_exception
-                && \in_array((int) $x->getCode(), [Db::ER_LOCK_DEADLOCK, Db::ER_LOCK_WAIT_TIMEOUT, Db::CR_SERVER_GONE_ERROR, 2013], true)) {
+                && \in_array((int) $x->getCode(), [Db::ER_LOCK_DEADLOCK, Db::ER_LOCK_WAIT_TIMEOUT, Db::CR_SERVER_GONE_ERROR, Db::CR_SERVER_LOST], true)) {
                 return true;
             }
         }

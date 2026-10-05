@@ -73,14 +73,34 @@ final class DomainError extends \RuntimeException
         return new self('uniundata_item_not_found', \__('The book was not found.', 'uniundata-books'), 404, ['book_item_id' => $itemId]);
     }
 
-    public static function itemUnavailable(int $itemId, string $availabilityStatus, ?\Throwable $previous = null): self
+    /**
+     * @param array<string, mixed> $extra Например ['reason' => 'currency', 'currency' => 'EUR', 'shop_currency' => 'RUB'].
+     */
+    public static function itemUnavailable(int $itemId, string $availabilityStatus, ?\Throwable $previous = null, array $extra = []): self
     {
         return new self(
             'uniundata_item_unavailable',
             \__('This book is already reserved or no longer available.', 'uniundata-books'),
             409,
-            ['book_item_id' => $itemId, 'availability_status' => $availabilityStatus],
+            ['book_item_id' => $itemId, 'availability_status' => $availabilityStatus] + $extra,
             $previous,
+        );
+    }
+
+    /** Цена экземпляра не в валюте магазина (option uniundata_currency): такой экземпляр не резервируется. */
+    public static function itemCurrencyNotAccepted(int $itemId, string $availabilityStatus, string $itemCurrency, string $shopCurrency): self
+    {
+        return new self(
+            'uniundata_item_unavailable',
+            \__('This book cannot be reserved: its price is not in the shop currency.', 'uniundata-books'),
+            409,
+            [
+                'book_item_id' => $itemId,
+                'availability_status' => $availabilityStatus,
+                'reason' => 'currency',
+                'currency' => $itemCurrency,
+                'shop_currency' => $shopCurrency,
+            ],
         );
     }
 
@@ -92,6 +112,21 @@ final class DomainError extends \RuntimeException
             409,
             ['book_item_id' => $itemId, 'max_attempts' => $maxAttempts],
             $previous,
+        );
+    }
+
+    /** Лимит одновременных активных резервов пользователя (option uniundata_max_active_reservations). */
+    public static function activeReservationLimit(int $maxActive): self
+    {
+        return new self(
+            'uniundata_active_reservation_limit',
+            \sprintf(
+                /* translators: %d: maximum number of books a customer can hold at the same time */
+                \__('You can hold at most %d reserved books at the same time.', 'uniundata-books'),
+                $maxActive,
+            ),
+            409,
+            ['max_active_reservations' => $maxActive],
         );
     }
 
@@ -127,6 +162,27 @@ final class DomainError extends \RuntimeException
     public static function orderNotPayable(string $orderStatus): self
     {
         return new self('uniundata_order_not_payable', \__('This order cannot be paid.', 'uniundata-books'), 409, ['order_status' => $orderStatus]);
+    }
+
+    /** POST /orders/{id}/cancel: банк уже обрабатывает платёж или заказ оплачен/закрыт. */
+    public static function orderNotCancellable(string $orderStatus): self
+    {
+        return new self('uniundata_order_not_cancellable', \__('This order cannot be cancelled.', 'uniundata-books'), 409, ['order_status' => $orderStatus]);
+    }
+
+    /**
+     * Checkout с устаревшей версией оферты/политики: клиент показывает новые тексты и повторяет запрос.
+     *
+     * @param array<string, string> $currentVersions ['offer' => '2026-09', 'privacy' => '2026-07']
+     */
+    public static function termsOutdated(array $currentVersions): self
+    {
+        return new self(
+            'uniundata_terms_outdated',
+            \__('The terms have been updated. Please review and accept the current version.', 'uniundata-books'),
+            409,
+            ['current_versions' => $currentVersions],
+        );
     }
 
     public static function rateLimited(int $retryAfterSeconds): self

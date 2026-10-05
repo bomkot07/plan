@@ -1,29 +1,31 @@
 # 7. Пользователи, роли, capabilities и персональные данные
 
 > **Кратко.** Учётные записи хранятся в `wp_users`, своей таблицы пользователей нет. `user_id` во всех
-> таблицах магазина — это `wp_users.ID`. Плагин работает без WooCommerce, поэтому у него своя роль
-> `book_customer` и две роли персонала. Доступ к заказу проверяет мета-capability `view_book_order`
-> через `map_meta_cap`. Минимальный профиль WordPress (имя, фамилия, необязательное отчество) лежит в
-> `wp_usermeta`. Телефон, адреса и B2B-реквизиты — в `wp_book_customer_profiles`, согласия — в
-> `wp_book_user_consents`. Заказ хранит снимок данных покупателя. Заказы не удаляются, а анонимизируются
-> в два этапа с учётом сроков хранения бухгалтерских документов.
+> таблицах магазина — это `wp_users.ID` сайта магазина. Плагин работает без WooCommerce, поэтому у него
+> своя роль `book_customer` и две роли персонала. Доступ к заказу проверяет мета-capability
+> `view_book_order` через `map_meta_cap` (`Plugin::mapMetaCap()`). Минимальный профиль (имя, фамилия,
+> необязательное отчество) лежит в `wp_usermeta`, телефон, адреса и реквизиты — в
+> `wp_book_customer_profiles`, согласия — в `wp_book_user_consents`, а заказ хранит снимок данных
+> покупателя. Персональные данные обрабатываются по 152-ФЗ (основной вариант), GDPR описан как вариант для
+> ЕС. Строки заказов не удаляются: контакты обезличиваются по сроку хранения (`orders.pii_erased_at`),
+> ФИО — после бухгалтерского срока. Единый вход для new.libsmr.ru и shop.libsmr.ru — § 7.13.
 
 ## 7.1 Принципы
 
-1. **Одна идентичность — `wp_users`.** Вход, пароль, восстановление доступа, Application Passwords,
-   сессии и подтверждение смены email делает ядро. Плагин ссылается на `wp_users.ID` логически,
-   без FOREIGN KEY (§ 7.12).
+1. **Одна идентичность — `wp_users` сайта магазина.** Вход, пароль, восстановление доступа, Application
+   Passwords, сессии и подтверждение смены email делает ядро. Плагин ссылается на `wp_users.ID`
+   логически, без FOREIGN KEY (§ 7.12).
 2. **Права — только через capabilities.** Каждый REST-маршрут и экран админки проверяет
    `current_user_can()`. ID пользователя берётся только из `get_current_user_id()`, никогда из параметров.
 3. **Роль покупателя — `book_customer`.** Роль WooCommerce `customer` не используется, даже если WC
    установлен для других задач: её семантикой управляет WC.
-4. **Минимизация PII.** Собирается только то, что нужно для исполнения заказа и бухгалтерии.
-   Структурированные данные хранятся в своих таблицах с CHECK и индексами. В заказ копируется снимок.
-   Журналы и аудит хранят `user_id`, но не значения PII.
+4. **Минимизация ПДн.** Собирается только то, что нужно для исполнения заказа, чека и бухгалтерии.
+   Структурированные данные лежат в своих таблицах с CHECK и индексами, в заказ копируется снимок.
+   Журналы и аудит хранят `user_id`, но не значения ПДн.
 
 ## 7.2 Роли и capabilities
 
-### Матрица
+Карта ролей задана в `src/Install/Roles.php` (`Roles::ROLES`).
 
 | Capability | Гость | `book_customer` | `book_catalog_manager` | `book_order_manager` | `administrator` | Назначение |
 |---|---|---|---|---|---|---|
@@ -34,326 +36,129 @@
 | `view_own_book_orders` | — | да | — | да | да | `GET /orders`, свой заказ через `view_book_order` |
 | `manage_book_catalog` | — | — | да | — | да | Экраны записей и экземпляров, `POST /admin/items/{id}/block`, `…/unblock` |
 | `manage_book_sync` | — | — | да | — | да | `POST /admin/sync/run`, `GET /admin/sync/runs`, экран прогонов |
-| `manage_book_orders` | — | — | — | да | да | Любой заказ (`view_book_order` для чужого), отмена и возврат из админки, `needs_attention` |
+| `manage_book_orders` | — | — | — | да | да | Любой заказ (`view_book_order` для чужого), отмена и возврат из админки, разбор `needs_attention` |
 | `manage_book_reservations` | — | — | — | да | да | `POST /admin/reservations/{id}/release`, экран резервов |
-| `view_book_order` (мета, с ID заказа) | — (`do_not_allow`) | только свой заказ | нет (нет ни `view_own_book_orders`, ни `manage_book_orders`) | любой заказ | любой заказ | § 7.4: владелец → `view_own_book_orders`, иначе → `manage_book_orders` |
+| `view_book_order` (мета, с ID заказа) | — | только свой заказ | нет | любой заказ | любой заказ | § 7.4 |
 
-¹ Гостю capability назначить нельзя (§ 7.3). Каталог, карточки и `GET /catalog/availability`
-публичны и `view_book_catalog` не проверяют. Эта capability нужна для режима закрытой витрины: если
-фильтр `uniundata_catalog_requires_login` вернёт `true`, шаблоны и маршруты каталога начнут её
-проверять. Так включается предпросмотр новых поступлений только для зарегистрированных или закрытый
-B2B-каталог.
+¹ Гостю capability назначить нельзя (§ 7.3). Каталог, карточки и `GET /catalog/availability` публичны и
+`view_book_catalog` не проверяют. Capability зарезервирована для режима закрытой витрины (предпросмотр
+поступлений для зарегистрированных, B2B-каталог): если фильтр `uniundata_catalog_requires_login` вернёт
+`true`, её начнут проверять шаблоны витрины и `CatalogController`. В PHP-примерах этот режим не
+реализован.
 
 ### Действия персонала, которым нужны несколько прав
 
-| Действие | Требуется | Почему |
+Права админ-маршрутов совпадают с `src/Rest/AdminController.php` и [06](06-rest-api.md) § 6.3.8.
+
+| Действие | Требуется | Поведение |
 |---|---|---|
-| Заблокировать экземпляр в статусе `available` | `manage_book_catalog` | Действие каталога |
-| Заблокировать экземпляр в чужой корзине (`reserved`) | `manage_book_catalog` **и** `manage_book_reservations` | Сначала снимается резерв (`released_by_admin`), затем ставится `blocked`, в одной транзакции (см. [09](09-migrations-tests-edge-cases.md)) |
-| Заблокировать экземпляр в `checkout_pending` | `manage_book_catalog` **и** `manage_book_orders` | Сначала отменяется заказ, только потом блокировка |
-| Настройки плагина (TTL оплаты, источник синхронизации, версии документов) | `manage_options` | Только администратор: настройки меняют бизнес-правила |
-| Экспорт и удаление персональных данных (Инструменты → Приватность) | `export_others_personal_data` / `erase_others_personal_data` | Права ядра, которые WordPress сводит к `manage_options` (на мультисайте — `manage_network`). Менеджер заказов запросы субъектов данных не обрабатывает |
+| Заблокировать экземпляр в `available` | `manage_book_catalog` | `available → blocked` |
+| Заблокировать экземпляр в чужой корзине (`reserved`) | `manage_book_catalog` **и** `manage_book_reservations` | Резерв снимается (`released_by_admin`, попытка возвращается), экземпляр становится `blocked` — в одной транзакции. Без второго права — 403 с `data.required_capability` |
+| Заблокировать экземпляр в `checkout_pending` | — | 409: сначала менеджер заказов отменяет заказ (`manage_book_orders`), затем блокировка |
+| Разблокировать | `manage_book_catalog` | `blocked →` release target по `source_status`: `available`, `sync_missing` или `withdrawn` |
+| Настройки плагина (валюта, TTL оплаты, версии документов) | `manage_options` | Только администратор: настройки меняют бизнес-правила |
+| Экспорт и удаление ПДн («Инструменты → Приватность») | `export_others_personal_data` / `erase_others_personal_data` | Ядро сводит их к `manage_options` (в мультисайте — `manage_network`). Менеджеры запросы субъектов не обрабатывают |
 
 Пояснения к ролям:
 
-- **Персонал не покупает служебной учётной записью.** У менеджеров нет `reserve_books`. Так права на
-  управление заказами отделены от покупок. Если сотрудник хочет купить книгу, он делает это личной
-  учётной записью, или ему добавляют вторую роль: `wp user add-role <id> book_customer`
-  (WordPress поддерживает несколько ролей на пользователя).
-- **`view_own_book_orders` у менеджера заказов** нужна, чтобы такой сотрудник с ролью покупателя видел
-  свои заказы в «Моих заказах» по общему правилу `map_meta_cap`.
-- **У менеджеров нет `list_users` и `edit_users`.** Персональные данные покупателей они видят только в
-  снимке конкретного заказа, а не в общем списке пользователей WordPress.
-- Если менеджер каталога загружает обложки в медиатеку (`wp_book_images.attachment_id`), ему
+- **Персонал не покупает служебной учётной записью.** У менеджеров нет `reserve_books`, так права на
+  управление заказами отделены от покупок. Сотрудник покупает личной учётной записью, или ему добавляют
+  вторую роль: `wp user add-role <id> book_customer`.
+- **`view_own_book_orders` у менеджера заказов** нужна, чтобы такой сотрудник со второй ролью покупателя
+  видел свои заказы по общему правилу `map_meta_cap`.
+- **У менеджеров нет `list_users` и `edit_users`.** Данные покупателя они видят только в снимке
+  конкретного заказа.
+- Менеджеру каталога, который загружает обложки в медиатеку (`wp_book_images.attachment_id`),
   дополнительно выдаётся `upload_files`.
 
 ## 7.3 Почему гостю нельзя выдать capability
 
-- В WordPress capabilities принадлежат **пользователю**: роли и личные права хранятся в usermeta
-  `{prefix}capabilities` конкретного `wp_users.ID`. Анонимный посетитель — это `WP_User` с `ID = 0`,
-  без ролей и без строки в `wp_users`. Роли «гость» в модели нет, и назначить её некому.
-- `current_user_can()` для пользователя 0 возвращает `true` только для встроенной `exist`. Её
-  `WP_User::has_cap()` выдаёт всем («Everyone is allowed to exist»), поэтому для разграничения она
-  бесполезна.
-- Технически можно подмешать права пользователю 0 фильтром `user_has_cap`, но это ложная модель.
-  Любой плагин, проверяющий ту же capability, откроет гостям свою функциональность. Кроме того,
-  `current_user_can()` начнёт отвечать «да» до проверки nonce. Права гостя остаются неявными и не
-  видны в `wp role list`.
+- В WordPress capabilities принадлежат **пользователю**: роли хранятся в usermeta `{prefix}capabilities`
+  конкретного `wp_users.ID`. Анонимный посетитель — `WP_User` с `ID = 0`, без ролей и без строки в
+  `wp_users`, поэтому назначить роль «гость» некому.
+- `current_user_can()` для пользователя 0 истинна только для встроенной `exist`, которую `has_cap()`
+  выдаёт всем. Для разграничения она бесполезна.
+- Подмешать права пользователю 0 фильтром `user_has_cap` технически можно, но тогда любой плагин,
+  проверяющий ту же capability, откроет гостям свою функциональность, а права гостя станут неявными и
+  невидимыми в `wp role list`.
 
-Как выражается публичный доступ:
+Публичный доступ выражается так:
 
-- публичные маршруты (`GET /catalog/availability`) объявляются с `'permission_callback' => '__return_true'`
-  (WordPress требует явный `permission_callback` у каждого маршрута). Страницы каталога не проверяют
-  права вообще;
-- всё, что меняет состояние, требует входа: `is_user_logged_in()` → иначе 401
-  `uniundata_auth_required`, затем `current_user_can(…)` → иначе 403 `uniundata_forbidden`;
-- в интерфейсе гость видит вместо «Отложить» ссылку «Войдите, чтобы отложить» на
-  `wp_login_url($currentUrl)`. После входа пользователь возвращается на ту же карточку, и её страница
-  уже не берётся из page cache.
+- публичные маршруты (`GET /catalog/availability`) объявлены с `'permission_callback' => '__return_true'`
+  (WordPress требует явный `permission_callback`). Страницы каталога права не проверяют;
+- всё, что меняет состояние, требует входа: 401 `uniundata_auth_required` без входа, затем 403
+  `uniundata_forbidden` без capability (`RestController::requireCapability()`);
+- гость видит вместо «Отложить» ссылку «Войдите, чтобы отложить» на `wp_login_url($currentUrl)`.
 
 ## 7.4 Мета-capability `view_book_order` и `map_meta_cap`
 
-`view_book_order` — мета-capability: её нет ни у одной роли. WordPress переводит её в примитивные
-права через фильтр `map_meta_cap` с учётом конкретного заказа. Владелец получает
-`view_own_book_orders`, остальные — `manage_book_orders`. В том же классе стоит защита удаления
-пользователя с незавершённой оплатой (§ 7.12).
+`view_book_order` не назначена ни одной роли. WordPress переводит её в примитивные права фильтром
+`map_meta_cap` с учётом конкретного заказа. Реализация — `Plugin::mapMetaCap()`:
 
 ```php
-<?php
-declare(strict_types=1);
-
-namespace Uniundata\Books\Security;
-
-final class Capabilities
-{
-    /** Деньги «в пути»: удалять такого покупателя из админки нельзя (§ 7.12). */
-    private const MONEY_IN_FLIGHT = ['pending_payment', 'payment_processing', 'paid'];
-
-    /** @var array<int, int|null> владелец заказа; кэш на время PHP-запроса */
-    private static array $orderOwners = [];
-
-    public static function register(): void
-    {
-        add_filter('map_meta_cap', [self::class, 'map'], 10, 4);
+// src/Plugin.php, фильтр map_meta_cap (10, 4)
+if ($cap === 'view_book_order') {
+    $orderId = (int) ($args[0] ?? 0);
+    if ($userId <= 0 || $orderId <= 0 || !$this->schemaReady) {
+        return ['do_not_allow'];
     }
-
-    /**
-     * @param string[] $caps примитивные права, которые уже вычислило ядро
-     * @param mixed[]  $args аргументы current_user_can(): [0] — ID заказа или пользователя
-     * @return string[]
-     */
-    public static function map(array $caps, string $cap, int $userId, array $args): array
-    {
-        return match ($cap) {
-            'view_book_order' => self::mapViewOrder($userId, (int) ($args[0] ?? 0)),
-            'delete_user'     => isset($args[0]) && self::hasMoneyInFlight((int) $args[0])
-                ? ['do_not_allow']
-                : $caps,
-            default           => $caps,
-        };
+    $owner = $this->orderOwner($orderId);      // SELECT user_id … WHERE id = %d, кэш на время запроса
+    if ($owner === null) {
+        return ['do_not_allow'];
     }
-
-    /** @return string[] */
-    private static function mapViewOrder(int $userId, int $orderId): array
-    {
-        if ($userId <= 0 || $orderId <= 0) {
-            return ['do_not_allow'];
-        }
-        $ownerId = self::orderOwner($orderId);
-        if ($ownerId === null) {
-            return ['do_not_allow'];
-        }
-        return $ownerId === $userId ? ['view_own_book_orders'] : ['manage_book_orders'];
-    }
-
-    private static function orderOwner(int $orderId): ?int
-    {
-        if (!array_key_exists($orderId, self::$orderOwners)) {
-            global $wpdb;
-            $owner = $wpdb->get_var($wpdb->prepare(
-                "SELECT user_id FROM {$wpdb->prefix}book_orders WHERE id = %d",
-                $orderId
-            ));
-            self::$orderOwners[$orderId] = $owner === null ? null : (int) $owner;
-        }
-        return self::$orderOwners[$orderId];
-    }
-
-    private static function hasMoneyInFlight(int $userId): bool
-    {
-        global $wpdb;
-        $in = implode(',', array_fill(0, count(self::MONEY_IN_FLIGHT), '%s'));
-        return (bool) $wpdb->get_var($wpdb->prepare(
-            "SELECT EXISTS (SELECT 1 FROM {$wpdb->prefix}book_orders
-                             WHERE user_id = %d AND status IN ($in))",
-            $userId,
-            ...self::MONEY_IN_FLIGHT
-        ));
-    }
+    return [$owner === $userId ? 'view_own_book_orders' : 'manage_book_orders'];
+}
+if ($cap === 'delete_user' && isset($args[0]) && (int) $args[0] > 0 && $this->schemaReady) {
+    return $this->hasMoneyInFlight((int) $args[0]) ? ['do_not_allow'] : $caps;   // § 7.12
 }
 ```
 
-Использование в контроллере. Отсутствующий и чужой заказ дают **одинаковый 404**, чтобы ответ не
-раскрывал существование заказа:
+Использование — `OrderController::getOrder()`. У маршрута `GET /orders/{public_order_id}`
+`permission_callback` — только `requireLogin()` (иначе 401): проверить владельца до загрузки заказа нельзя.
+Callback читает заказ по `public_order_id` и для отсутствующего и чужого заказа отвечает **одинаковым
+404** `uniundata_order_not_found`, чтобы ответ не раскрывал существование заказа:
 
 ```php
-<?php
-declare(strict_types=1);
-
-namespace Uniundata\Books\Rest;
-
-final class OrderController
-{
-    public function __construct(private readonly OrderReadModel $orders) {}
-
-    public function getOrder(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
-    {
-        $order = $this->orders->findByPublicId((string) $request['public_order_id']);
-        if ($order === null || !current_user_can('view_book_order', (int) $order['id'])) {
-            return new \WP_Error(
-                'uniundata_order_not_found',
-                __('Заказ не найден.', 'uniundata-books'),
-                ['status' => 404]
-            );
-        }
-        // Менеджер видит служебные поля (needs_attention, attention_reason), владелец — нет.
-        return new \WP_REST_Response($this->orders->present($order, current_user_can('manage_book_orders')));
-    }
+if ($order === null || !current_user_can('view_book_order', (int) $order['id'])) {
+    throw DomainError::orderNotFound();
 }
+return $this->present($order, current_user_can('manage_book_orders')); // служебные поля — только менеджеру
 ```
 
-Детали:
-
-- `permission_callback` маршрута `GET /orders/{public_order_id}` проверяет только `is_user_logged_in()`
-  (иначе 401). Проверить владельца до загрузки заказа нельзя, поэтому право проверяется в callback.
-- `POST /orders/{id}/pay` и `/cancel` проверяют не `view_book_order`, а **строгое владение**
-  (`$order['user_id'] === get_current_user_id()` + `create_book_orders`). Менеджер не должен оплачивать
-  или отменять чужой заказ от имени покупателя: у менеджера для этого свои действия в админке.
+- `POST /orders/{id}/pay` и `/cancel` требуют `create_book_orders` и **строгого владения**: `CheckoutService`
+  ищет заказ по `public_order_id` и `user_id` текущего пользователя, а для чужого отвечает 404. Менеджер не
+  оплачивает и не отменяет заказ от имени покупателя: у него свои действия в админке.
 - `do_not_allow` отказывает даже суперадминистратору мультисайта.
-- `map_meta_cap` вызывается на каждый `current_user_can()`, поэтому владелец кэшируется на время
-  запроса. Персистентный кэш не нужен: владелец заказа не меняется.
+- `map_meta_cap` вызывается на каждый `current_user_can()`, поэтому владелец кэшируется на время запроса.
+  Владелец заказа не меняется, так что персистентный кэш не нужен.
 
-## 7.5 Регистрация ролей: код и версионирование
+## 7.5 Регистрация ролей и версионирование
 
-Роли WordPress хранятся в option `{prefix}user_roles`. `add_role()` ничего не делает для существующей
-роли, а каждый `add_cap()`/`remove_cap()` перезаписывает эту option. Поэтому карта ролей задаётся в коде,
-а БД приводится к ней **по версии**: при активации и на `init`, когда выросла `Roles::VERSION`.
-
-```php
-<?php
-declare(strict_types=1);
-
-namespace Uniundata\Books\Install;
-
-final class Roles
-{
-    /** Увеличивать при ЛЮБОМ изменении ROLES. */
-    public const VERSION = 1;
-    public const VERSION_OPTION = 'uniundata_roles_version';
-
-    /** Собственные права плагина. Синхронизатор снимает только их и не трогает права ядра. */
-    public const PLUGIN_CAPS = [
-        'view_book_catalog', 'reserve_books', 'create_book_orders', 'view_own_book_orders',
-        'manage_book_catalog', 'manage_book_orders', 'manage_book_sync', 'manage_book_reservations',
-    ];
-
-    /** label = null: роль ядра, её не создаём, только добавляем права. */
-    private const ROLES = [
-        'book_customer' => [
-            'label' => 'Покупатель книг',
-            'caps'  => ['read', 'view_book_catalog', 'reserve_books', 'create_book_orders', 'view_own_book_orders'],
-        ],
-        'book_catalog_manager' => [
-            'label' => 'Менеджер каталога',
-            'caps'  => ['read', 'view_book_catalog', 'manage_book_catalog', 'manage_book_sync'],
-        ],
-        'book_order_manager' => [
-            'label' => 'Менеджер заказов',
-            'caps'  => ['read', 'view_book_catalog', 'view_own_book_orders', 'manage_book_orders',
-                        'manage_book_reservations'],
-        ],
-        'administrator' => [
-            'label' => null,
-            'caps'  => ['read', 'view_book_catalog', 'reserve_books', 'create_book_orders', 'view_own_book_orders',
-                        'manage_book_catalog', 'manage_book_orders', 'manage_book_sync', 'manage_book_reservations'],
-        ],
-    ];
-
-    /** Вызывается на init: дешёвое сравнение autoload-option. */
-    public static function maybeUpgrade(): void
-    {
-        if ((int) get_option(self::VERSION_OPTION, 0) < self::VERSION) {
-            self::install();
-        }
-    }
-
-    /** Вызывается при активации и из maybeUpgrade(). Идемпотентно. */
-    public static function install(): void
-    {
-        foreach (self::ROLES as $slug => $def) {
-            $role = get_role($slug);
-            if ($role === null) {
-                if ($def['label'] === null) {
-                    continue; // нестандартная сборка без administrator: роль ядра не создаём
-                }
-                $role = add_role($slug, $def['label'], array_fill_keys($def['caps'], true));
-                if ($role === null) {
-                    continue;
-                }
-            }
-            foreach ($def['caps'] as $cap) {
-                if (!$role->has_cap($cap)) {
-                    $role->add_cap($cap);
-                }
-            }
-            // Понижение прав при апгрейде: снимаем СВОИ права, которых больше нет в карте.
-            foreach (array_diff(self::PLUGIN_CAPS, $def['caps']) as $cap) {
-                if ($role->has_cap($cap)) {
-                    $role->remove_cap($cap);
-                }
-            }
-        }
-        // Регистрация через wp-login.php создаёт покупателя. Явный выбор администратора не трогаем.
-        if (get_option('default_role') === 'subscriber') {
-            update_option('default_role', 'book_customer');
-        }
-        update_option(self::VERSION_OPTION, self::VERSION, true);
-    }
-
-    /** Из uninstall.php. На больших сайтах — пакетами через WP-CLI. */
-    public static function uninstall(): void
-    {
-        $admin = get_role('administrator');
-        foreach (self::PLUGIN_CAPS as $cap) {
-            $admin?->remove_cap($cap); // remove_cap() принимает ровно одну capability
-        }
-        foreach (array_keys(self::ROLES) as $slug) {
-            if ($slug === 'administrator') {
-                continue;
-            }
-            foreach (get_users(['role' => $slug, 'fields' => 'ID']) as $id) {
-                $user = new \WP_User((int) $id);
-                $user->remove_role($slug);
-                if ($user->roles === []) {
-                    $user->add_role('subscriber');
-                }
-            }
-            remove_role($slug);
-        }
-        if (get_option('default_role') === 'book_customer') {
-            update_option('default_role', 'subscriber');
-        }
-        delete_option(self::VERSION_OPTION);
-    }
-}
-```
-
-Правила версионирования:
+Роли WordPress хранятся в option `{prefix}user_roles`. `add_role()` не меняет существующую роль, а каждый
+`add_cap()`/`remove_cap()` перезаписывает всю option. Поэтому карта ролей задана в коде
+(`Roles::ROLES`, `Roles::PLUGIN_CAPS`), а БД приводится к ней **по версии**: `Roles::install()` при
+активации и в `wp uniundata migrate`, `Roles::maybeUpgrade()` на `init`, когда option
+`uniundata_roles_version` меньше `Roles::VERSION`. `install()` идемпотентна: две параллельные загрузки
+после деплоя дают одинаковый результат. Она же меняет `default_role` с `subscriber` на `book_customer`,
+но явный выбор администратора не трогает.
 
 | Изменение | Действие |
 |---|---|
-| Новая capability у роли, новая роль | Изменить `ROLES`, увеличить `VERSION`. На первом `init` после деплоя права добавятся |
-| Право у роли отозвано | Изменить `ROLES`, увеличить `VERSION`. Синхронизатор снимет право, но только из `PLUGIN_CAPS`: права ядра и выданные вручную права ядра не трогаются |
-| Переименование capability | Две версии: в `N` добавить новую и проверять обе, в `N+1` снять старую (expand → contract, как у миграций схемы) |
-| Деактивация плагина | Роли **не удаляются**: иначе пользователи остались бы с несуществующей ролью и без прав после повторной активации |
-| Удаление плагина | `Roles::uninstall()`: пользователи переводятся в `subscriber`, роли удаляются, права администратора снимаются. Таблицы заказов остаются (см. [09](09-migrations-tests-edge-cases.md)) |
-| Мультисайт | Роли хранятся у каждого сайта. При сетевой активации `install()` выполняется для каждого сайта через `switch_to_blog()`, для новых сайтов — на `wp_initialize_site` |
-
-Две параллельные загрузки после деплоя могут обе выполнить `install()`. Это безопасно: операции
-идемпотентны, последняя запись `update_option` одинакова.
+| Новая capability у роли, новая роль | Изменить `ROLES`, увеличить `VERSION`. Права добавятся на первом `init` после деплоя |
+| Право у роли отозвано | Изменить `ROLES`, увеличить `VERSION`. Синхронизатор снимет только права из `PLUGIN_CAPS`, права ядра и выданные вручную права ядра не трогаются |
+| Переименование capability | Две версии: в `N` добавить новую и проверять обе, в `N+1` снять старую (expand → contract) |
+| Деактивация плагина | Роли **не удаляются**, иначе пользователи остались бы с несуществующей ролью |
+| Удаление плагина | `Roles::uninstall()`: пользователи переводятся в `subscriber`, роли удаляются, права администратора снимаются. Таблицы заказов остаются ([09](09-migrations-tests-edge-cases.md)) |
+| Мультисайт | Роли хранятся у каждого сайта. При сетевой активации `install()` выполняется для каждого сайта, для новых — на `wp_initialize_site`. Покупатель основного сайта получает роль на сайте магазина отдельно (§ 7.13) |
 
 Проверка: `wp role list`, `wp cap list book_customer`, `wp eval 'var_dump(user_can(5, "reserve_books"));'`.
 
-**Покупатели не работают в `/wp-admin/`.** Право `read` открывает консоль и `profile.php`. Профиль и
-заказы покупателя живут на странице аккаунта витрины, поэтому из консоли их перенаправляем:
+**Покупатели не работают в `/wp-admin/`.** Право `read` открывает консоль и `profile.php`, а профиль и
+заказы покупателя живут на странице аккаунта витрины (†). Поэтому консоль для них закрывается:
 
 ```php
-<?php
-declare(strict_types=1);
-
 add_action('admin_init', static function (): void {
-    global $pagenow;
-    if (wp_doing_ajax() || $pagenow === 'admin-post.php' || !is_user_logged_in()) {
+    if (wp_doing_ajax() || $GLOBALS['pagenow'] === 'admin-post.php' || !is_user_logged_in()) {
         return; // admin-ajax.php (в т. ч. action=rest-nonce) и admin-post.php должны работать
     }
     foreach (['edit_posts', 'manage_book_catalog', 'manage_book_orders', 'manage_book_sync',
@@ -365,573 +170,341 @@ add_action('admin_init', static function (): void {
     wp_safe_redirect(home_url('/account/'));
     exit;
 });
-
-add_filter('show_admin_bar', static fn (bool $show): bool =>
-    $show && (current_user_can('edit_posts') || current_user_can('manage_book_orders')
-        || current_user_can('manage_book_catalog')));
 ```
 
 ## 7.6 Какие данные нужны для оформления заказа
 
-| Данные | Обязательно | Когда нужно | Где живёт | Снимок в заказе |
-|---|---|---|---|---|
-| ID пользователя | да | всегда | `wp_users.ID` | `orders.user_id` |
-| Email | да | всегда: подтверждение, статус, документы, восстановление доступа | `wp_users.user_email` (ядро подтверждает смену email письмом) | `customer_email` |
-| Имя, фамилия | да | счёт, адресат отправления | usermeta `first_name`, `last_name` | `customer_first_name`, `customer_last_name` (NOT NULL) |
-| Отчество | **нет** | если покупатель сам указал (локальная практика) | usermeta `middle_name` | `customer_middle_name` (NULL) |
-| `display_name` | нет | только для UI | `wp_users.display_name` | не копируется |
-| Телефон | только если его требует выбранная доставка (курьер, служба доставки) | checkout с такой доставкой | `wp_book_customer_profiles.phone_e164` | `customer_phone` (E.164) |
-| Адрес доставки | только при доставке (не при самовывозе) | checkout | `profiles.default_shipping_address` — только для автозаполнения | `shipping_address_json` — **источник истины** для этого заказа |
-| Платёжный адрес | по требованию бухгалтерии (счёт для B2B) | checkout | `profiles.default_billing_address` | `billing_address_json` |
-| Компания, VAT ID | только B2B | checkout «как организация» | `profiles.company_name`, `vat_id` | `billing_address_json.company`, `.vat_id` |
-| Согласие с офертой | да | каждый checkout | `wp_book_user_consents` (`offer`) | `orders.offer_consent_id` |
-| Согласие с политикой ПДн | да | регистрация или первый checkout для текущей версии | `wp_book_user_consents` (`privacy`) | — |
-| Согласие на рассылку | нет, отдельная галочка, не предвыбрана | по желанию | `wp_book_user_consents` (`marketing`) | — |
-| IP, User-Agent | нет, техническое доказательство согласия | в момент согласия | `consents.ip_address` (до 180 дней), `user_agent_sha256` | — |
+`POST /checkout` принимает объект `customer {first_name, last_name, middle_name?, phone?}`. Всё, что в нём
+не передано, `CheckoutService` берёт из профиля: usermeta `first_name`, `last_name`, `middle_name` и
+`wp_book_customer_profiles.phone_e164`. Если имени или фамилии нет ни там, ни там, ответ — 400
+`uniundata_invalid_param` (`param = customer.first_name` или `customer.last_name`).
 
-**Не собираем:** дату рождения, пол, паспортные данные, данные карты (их видит только банк; у нас —
+| Данные | Обязательно | Где живёт | Снимок в заказе |
+|---|---|---|---|
+| ID пользователя | да | `wp_users.ID` | `orders.user_id` |
+| Email | да: подтверждение, статус, электронный чек по 54-ФЗ | `wp_users.user_email` (смену подтверждает ядро письмом) | `customer_email` |
+| Имя, фамилия | да: счёт, получатель отправления | usermeta `first_name`, `last_name` | `customer_first_name`, `customer_last_name` |
+| Отчество | **нет**, только если покупатель сам указал | usermeta `middle_name` | `customer_middle_name` (NULL) |
+| `display_name` | нет, только для интерфейса | `wp_users.display_name` | не копируется |
+| Телефон | только если его требует способ доставки | `wp_book_customer_profiles.phone_e164` | `customer_phone` в формате E.164 (`+78461234567`) |
+| Адрес доставки | только при доставке (не при самовывозе) | `profiles.default_shipping_address` — только для автозаполнения | `shipping_address_json` — **источник истины** для этого заказа |
+| Платёжный адрес | по требованию бухгалтерии (счёт юрлицу) | `profiles.default_billing_address` | `billing_address_json` |
+| Организация, ИНН (РФ) или VAT ID (ЕС) | только B2B | `profiles.company_name`, `profiles.vat_id` | `company` в адресе (§ 7.9) |
+| Согласие с офертой | да, на каждый заказ | `wp_book_user_consents` (`offer`) | `orders.offer_consent_id` |
+| Согласие на обработку ПДн | да, на каждый заказ (§ 7.8) | `wp_book_user_consents` (`privacy`) | — |
+| Согласие на рассылку | нет, отдельная галочка, не отмечена заранее | `wp_book_user_consents` (`marketing`) | — |
+| IP и User-Agent | нет, техническое доказательство согласия | `consents.ip_address` (до 180 дней), `user_agent_sha256` | — |
+
+**Не собираем:** дату рождения, пол, паспортные данные, данные карты (их видит только банк, у нас —
 `card_brand` и `card_last4`), второй телефон, «как вы о нас узнали» в обязательных полях.
 
-Формат JSON адреса (`shipping_address_json`, `billing_address_json`, `default_*_address`):
+Формат адреса — белый список `CheckoutRequest::ADDRESS_FIELDS`. Лишние ключи отбрасываются, управляющие
+символы удаляются, длины проверяются в PHP до SQL. Обязательны `line1`, `city`, `postcode` и `country`
+(ISO 3166-1 alpha-2, верхний регистр):
 
 ```json
 {
-  "v": 1,
   "first_name": "Иван",
   "last_name": "Петров",
-  "middle_name": null,
   "company": null,
-  "vat_id": null,
-  "line1": "Hauptstraße 1",
+  "line1": "ул. Ленинградская, 24, кв. 5",
   "line2": null,
-  "postal_code": "10115",
-  "city": "Berlin",
-  "region": null,
-  "country_code": "DE"
+  "city": "Самара",
+  "region": "Самарская область",
+  "postcode": "443099",
+  "country": "RU"
 }
 ```
 
-Валидация на сервере. Белый список ключей, лишние ключи отбрасываются. `sanitize_text_field` и
-лимиты длины: имена ≤ 100 (как колонки `customer_*_name`), строки адреса ≤ 200, индекс ≤ 16.
-`country_code` проверяется по списку ISO 3166-1 alpha-2. Размер JSON ≤ 2 КБ. Сохраняется через
-`wp_json_encode`. Телефон в JSON адреса не дублируется: он хранится только в `customer_phone`.
-Поле `v` — версия формата, для будущих миграций.
+Пустые поля в JSON не сохраняются. Лимиты: имена — 100 символов (как колонки `customer_*_name`),
+`company`, `line1` и `line2` — 255, `city` и `region` — 100, `postcode` — 20. Телефон в адресе не
+дублируется: он хранится только в `customer_phone`. HTML не экранируется при записи — экранирование
+делается при выводе (`esc_html`).
 
 ## 7.7 Что хранить в `wp_usermeta`, а что — в таблицах магазина
 
 | Хранилище | Поля | Почему здесь |
 |---|---|---|
 | `wp_users` | `ID`, `user_email`, `user_login`, `user_pass`, `display_name`, `user_registered` | Ядро: аутентификация и идентичность |
-| `wp_usermeta` (ядро) | `first_name`, `last_name`, `{prefix}capabilities` | Стандартные поля профиля: их показывает «Профиль», экспортирует ядро, они удаляются вместе с пользователем |
-| `wp_usermeta` (плагин) | `middle_name` (необязательное), `uniundata_erasure_requested_at` (служебная метка § 7.11) | Скалярные необязательные значения без поиска и истории. Ключ `middle_name` без префикса: это поле того же уровня, что `first_name` и `last_name` ядра |
-| `wp_book_customer_profiles` | `phone_e164`, `phone_verified_at`, `default_shipping_address`, `default_billing_address`, `company_name`, `vat_id` | Строгий формат (`CHECK phone_e164 REGEXP '^\\+[1-9][0-9]{6,14}$'`), индекс `ix_profiles_phone` для поиска менеджером по телефону (у `meta_value` нет индекса), типизированные колонки и JSON. Одна строка на пользователя (`PRIMARY KEY (user_id)`), без дублей `meta_key`. Удаляется одним `DELETE` при стирании данных |
-| `wp_book_user_consents` | Согласия: тип, версия, хэш документа, время, IP, хэш UA, отзыв | Юридическое доказательство: append-only, несколько строк на пользователя, связь с заказом через FK `orders.offer_consent_id`. В usermeta это не выражается |
-| `wp_book_orders` | Снимок: email, телефон, ФИО, адреса, согласие | Заказ — бухгалтерский документ. Последующие правки профиля не должны его менять |
+| `wp_usermeta` (ядро) | `first_name`, `last_name`, `{prefix}capabilities` | Стандартный профиль: его показывает «Профиль», экспортирует ядро, удаляет `wp_delete_user()` |
+| `wp_usermeta` (плагин) | `middle_name` (необязательное), `uniundata_erasure_requested_at` (служебная метка § 7.11) | Скалярные необязательные значения без поиска и истории. Ключ `middle_name` без префикса: это поле того же уровня, что `first_name` и `last_name`. Регистрируется `register_meta()` с санитизацией и `auth_callback` (`Plugin::registerUserMeta()`) |
+| `wp_book_customer_profiles` | `phone_e164`, `phone_verified_at`, `default_shipping_address`, `default_billing_address`, `company_name`, `vat_id` | Строгий формат (`wp_book_customer_profiles_chk_phone`: `^\+[1-9][0-9]{6,14}$`), индекс `ix_profiles_phone` для поиска менеджером по телефону (у `meta_value` индекса нет), типизированные колонки и JSON. Одна строка на пользователя, удаляется одним `DELETE` |
+| `wp_book_user_consents` | Тип, версия, хэш документа, время, IP, хэш UA, отзыв | Юридическое доказательство: append-only, несколько строк на пользователя, связь с заказом через FK `orders.offer_consent_id` |
+| `wp_book_orders` | Снимок: email, телефон, ФИО, адреса, ссылка на согласие | Заказ — бухгалтерский документ, последующие правки профиля его не меняют |
 
-`middle_name` регистрируется как meta, чтобы её санитизировали и проверяли права:
+Телефон нормализуется в E.164 на сервере: `CheckoutRequest::normalizePhone()` убирает пробелы, скобки и
+дефисы, а формат проверяется регулярным выражением. Для строгой проверки по стране можно подключить
+`libphonenumber` (перенесённую в namespace плагина через Strauss или PHP-Scoper). CHECK в БД — второй
+рубеж. Изменения профиля пишутся в аудит (`customer.profile_updated`) списком **изменённых полей без
+значений**, чтобы журнал не стал второй копией ПДн.
 
-```php
-<?php
-declare(strict_types=1);
+## 7.8 Согласия и юридические документы
 
-register_meta('user', 'middle_name', [
-    'type'              => 'string',
-    'single'            => true,
-    'show_in_rest'      => false,
-    'sanitize_callback' => static fn ($value): string => mb_substr(sanitize_text_field((string) $value), 0, 100),
-    'auth_callback'     => static fn (bool $allowed, string $key, int $userId): bool => current_user_can('edit_user', $userId),
-]);
-```
+Для РФ (152-ФЗ) различаются три документа:
 
-Телефон нормализуется в E.164 на сервере (`libphonenumber`, перенесённая в namespace плагина через
-PHP-Scoper; регион по умолчанию — страна адреса). CHECK в БД — второй рубеж. История изменений профиля
-пишется в `wp_book_audit_log` (`customer.profile_updated`) со списком **изменённых полей без значений**,
-чтобы журнал не стал второй копией PII.
+| Документ | Что это | Как реализовано |
+|---|---|---|
+| **Оферта** (договор купли-продажи) | Основание для обработки данных, нужных для исполнения заказа (ст. 6 ч. 1 п. 5 152-ФЗ) | Строка `offer` на каждый заказ, ссылка из `orders.offer_consent_id` |
+| **Согласие на обработку ПДн** | С 01.09.2025 оформляется **отдельно** от других документов, которые подтверждает субъект (ст. 9 ч. 1). Его нельзя встроить в оферту или в текст «я согласен с политикой» | Отдельная галочка и отдельный текст, строка `privacy` на каждый заказ. Нужно ли согласие сверх договора, решает юрист; плагин в любом случае хранит доказательство |
+| **Политика обработки ПДн** | Публикуется на сайте (ст. 18.1 ч. 2). Это не согласие, с ней только знакомят | Ссылка в форме checkout и в тексте согласия |
+| **Согласие на рассылку** | Предварительное согласие на рекламу по email/SMS (ст. 18 ч. 1 закона «О рекламе») | Строка `marketing`, галочка не отмечена заранее. Отзыв — `withdrawn_at` |
 
-## 7.8 Согласия: `wp_book_user_consents`
+Поля `wp_book_user_consents`:
 
 | Поле | Содержимое |
 |---|---|
-| `consent_uuid` | Технический идентификатор согласия (`wp_generate_uuid4()`). Его можно показать пользователю и указать в письме-подтверждении |
-| `consent_type` | `offer` — оферта (новая строка на **каждый** заказ, ссылка из `orders.offer_consent_id`). `privacy` — политика обработки ПДн (одна строка на версию). `marketing` — рассылка |
-| `document_version`, `document_sha256` | Версия и SHA-256 точного текста принятой редакции. Хэш защищает от незаметной правки текста под тем же номером версии |
-| `accepted_at` | `UTC_TIMESTAMP(6)` сервера БД, а не время из браузера |
-| `ip_address` | `VARBINARY(16)` через `INET6_ATON()`, подходит для IPv4 и IPv6. Обнуляется через 180 дней |
+| `consent_uuid` | Технический идентификатор согласия (`wp_generate_uuid4()`), его можно указать в письме-подтверждении |
+| `consent_type` | `offer`, `privacy`, `marketing` |
+| `document_version`, `document_sha256` | Версия и SHA-256 точного текста принятой редакции. Хэш защищает от незаметной правки текста под тем же номером |
+| `accepted_at` | `UTC_TIMESTAMP(6)` сервера БД, а не время браузера |
+| `ip_address` | `VARBINARY(16)` через `INET6_ATON()` (IPv4 и IPv6). Обнуляется через 180 дней |
 | `user_agent_sha256` | Хэш, а не строка UA. Обнуляется вместе с IP |
-| `withdrawn_at` | Отзыв (для `marketing`). Строка не удаляется: отзыв — отдельная дата |
+| `withdrawn_at` | Отзыв. Строка не удаляется |
 
-**Версии документов** хранятся в option `uniundata_terms_versions`:
+**Версии документов** хранятся в option `uniundata_terms_versions` (формат читают
+`CheckoutService::termsSnapshot()` и `Plugin::configProblems()`):
 
-```json
-{
-  "offer":   {"current": "2026-09-01", "versions": {"2026-09-01": {"sha256": "9f2c…", "url": "https://example.com/legal/offer-2026-09-01.pdf"}}},
-  "privacy": {"current": "2026-06-15", "versions": {"2026-06-15": {"sha256": "51ab…", "url": "https://example.com/legal/privacy-2026-06-15.pdf"}}}
-}
+```bash
+wp option update uniundata_terms_versions --format=json \
+  '{"offer":{"version":"2026-09","sha256":"<64 hex>","url":"https://shop.libsmr.ru/legal/offer-2026-09.pdf"},
+    "privacy":{"version":"2026-09","sha256":"<64 hex>","url":"https://shop.libsmr.ru/legal/pd-consent-2026-09.pdf"}}'
 ```
 
-Тексты всех редакций хранятся неизменяемыми файлами. Ревизии страниц WordPress для этого не подходят:
-их можно удалить или отредактировать. `POST /checkout` передаёт `accept_offer_version` и
-`accept_privacy_version`. Если версия не совпадает с `current` (пользователь держал страницу открытой во
-время смены редакции), сервер отвечает 400 `uniundata_invalid_param` с актуальной версией в `data`, и
-пользователь подтверждает новый текст.
+Ключ `url` нужен витрине, плагин его не проверяет. Тексты всех редакций хранятся неизменяемыми файлами:
+ревизии страниц WordPress для этого не годятся, их можно удалить или отредактировать. Пока option не
+заполнен, администратор видит уведомление, а checkout отвечает 500 `uniundata_internal`.
 
-**Запись в checkout.** Согласия вставляются в той же транзакции, что и заказ, перед `INSERT` заказа:
-нужен `offer_consent_id` для FK. Таблица append-only, `FOR UPDATE` по ней не берётся, поэтому в
-глобальный порядок блокировок она не входит. Оферта — новая строка всегда. Политика — только если нет
-неотозванной строки с текущей версией.
+**Запись в checkout.** `POST /checkout` передаёт `accept_offer_version` и `accept_privacy_version`. Если
+версия не совпадает с текущей (страница была открыта во время смены редакции), ответ — 409
+`uniundata_terms_outdated` с `data.current_versions`, и покупатель подтверждает новый текст. Обе строки
+согласий вставляются в той же транзакции, что и заказ, перед `INSERT` заказа: нужен `offer_consent_id`
+для FK. Таблица append-only, `FOR UPDATE` по ней не берётся, поэтому в порядок блокировок она не входит.
 
 ```sql
--- IP проверяется в PHP (filter_var(..., FILTER_VALIDATE_IP)); пустая строка → NULL
+-- CheckoutService::insertConsent(); пустой IP → NULL
 INSERT INTO wp_book_user_consents
-  (consent_uuid, user_id, consent_type, document_version, document_sha256,
-   accepted_at, ip_address, user_agent_sha256)
-VALUES (%s, %d, 'offer', %s, %s,
-        UTC_TIMESTAMP(6), INET6_ATON(NULLIF(%s, '')), NULLIF(%s, ''));
-
--- Чтение для экспорта / спора
-SELECT consent_uuid, consent_type, document_version, accepted_at,
-       INET6_NTOA(ip_address) AS ip, withdrawn_at
-  FROM wp_book_user_consents
- WHERE user_id = %d
- ORDER BY accepted_at;
-
--- Ежедневная минимизация (задача uniundata_privacy_retention), пакетами
-UPDATE wp_book_user_consents
-   SET ip_address = NULL, user_agent_sha256 = NULL
- WHERE ip_address IS NOT NULL
-   AND accepted_at < UTC_TIMESTAMP(6) - INTERVAL %d DAY   -- 180 по умолчанию
- LIMIT 1000;
-
--- Отзыв согласия на рассылку
-UPDATE wp_book_user_consents
-   SET withdrawn_at = UTC_TIMESTAMP(6)
- WHERE user_id = %d AND consent_type = 'marketing' AND withdrawn_at IS NULL;
+  (consent_uuid, user_id, consent_type, document_version, document_sha256, accepted_at, ip_address, user_agent_sha256)
+VALUES (%s, %d, %s, %s, %s, UTC_TIMESTAMP(6), INET6_ATON(NULLIF(%s, '')), NULLIF(%s, ''));
 ```
 
-`$wpdb->prepare()` не умеет передавать `NULL`: он превращает `null` в `''`. Поэтому необязательные
-значения оборачиваются в `NULLIF(%s, '')`. `INET6_ATON('')` и `INET6_ATON('garbage')` в MySQL 8
-возвращают `NULL` (проверено на 8.0.46).
+`$wpdb->prepare()` не умеет передавать `NULL` (превращает его в `''`), поэтому необязательные значения
+обёрнуты в `NULLIF(%s, '')`. IP проверяется в PHP (`FILTER_VALIDATE_IP`) до SQL. Это обязательно:
+транзакции плагина идут в `STRICT_TRANS_TABLES`, а в этом режиме `INSERT` с `INET6_ATON('garbage')`
+падает с ошибкой 1411 (проверено на 8.0.46; без strict-режима функция вернула бы `NULL`).
 
-Источник IP — `REMOTE_ADDR`. `X-Forwarded-For` учитывается, только если `REMOTE_ADDR` входит в список
-доверенных прокси (константа `UNIUNDATA_TRUSTED_PROXIES`). Иначе заголовок подделывается клиентом.
+Источник IP — `REMOTE_ADDR`. За доверенным прокси реальный IP возвращает фильтр `uniundata_client_ip`
+([06](06-rest-api.md) § 6.6). `X-Forwarded-For` без проверки не используется: его подделывает клиент.
 
-**Почему 180 дней для IP.** IP — вспомогательное доказательство. Основное — `consent_uuid`, время,
-версия и хэш текста, привязанные к аутентифицированному пользователю и к заказу. Полгода покрывают
-типичное окно споров по платежам, а дальше IP становится лишней PII. Срок задаётся фильтром
-`uniundata_consent_ip_retention_days` и утверждается юристом.
+**Почему 180 дней для IP.** IP — вспомогательное доказательство. Основное — `consent_uuid`, время, версия
+и хэш текста, привязанные к аутентифицированному пользователю и к заказу. Полгода покрывают типичное окно
+споров по платежам, дальше IP — лишние ПДн. Срок задаётся фильтром `uniundata_consent_ip_retention_days`
+и утверждается юристом.
 
-## 7.9 B2B-реквизиты
+## 7.9 Реквизиты для B2B
 
-- В профиле — `company_name` и `vat_id` (оба необязательны). В заказе — снимок в `billing_address_json`
-  (`company`, `vat_id`, юридический адрес). Счёт строится только из снимка.
-- Проверка VAT ID (например, через VIES) — HTTP-запрос **до** транзакции checkout с таймаутом 3 с.
-  Результат кладётся в снимок: `"vat_id_validated": true, "vat_id_checked_at": "…Z"`. Если сервис
-  недоступен, заказ оформляется как B2C (с НДС), а не блокируется.
-- Налоговые последствия B2B (reverse charge, ставки) определяет бухгалтерия. Плагин хранит факты:
-  реквизиты на момент заказа и результат проверки.
-- Реквизиты организации — не персональные данные, но имя контактного лица и VAT ID
-  индивидуального предпринимателя — персональные. Поэтому B2B-поля проходят через тот же эрейзер и
-  ту же ретенцию, что и платёжный адрес.
+- В профиле — `company_name` и `vat_id` (оба необязательны). В РФ в `vat_id` хранится ИНН (10 или 12
+  цифр), в ЕС — VAT ID.
+- В v1 в снимок заказа попадает только `company` из платёжного адреса. ИНН/VAT ID в снимке появится, когда
+  бизнес включит выставление счетов юрлицам: для этого расширяется белый список `CheckoutRequest`
+  (например, поле `tax_id`) и счёт строится только из снимка.
+- Внешняя проверка реквизитов (ФНС, VIES) — HTTP-запрос **до** транзакции checkout с таймаутом 3 с. Если
+  сервис недоступен, заказ оформляется как обычный, без блокировки.
+- Реквизиты организации — не ПДн, но имя контактного лица и ИНН индивидуального предпринимателя —
+  персональные данные. Поэтому B2B-поля проходят тот же эрейзер и те же сроки, что и платёжный адрес.
 
-## 7.10 Минимизация PII и сроки хранения
+## 7.10 Персональные данные: 152-ФЗ и вариант для ЕС
 
-| Данные | Где | Цель | Срок | Механизм |
+### 7.10.1 152-ФЗ — основной вариант
+
+Магазин на shop.libsmr.ru, скорее всего, — оператор ПДн по российскому праву. Плагин закрывает
+техническую часть. Организационную часть (локальные акты, ответственный, уровень защищённости ИСПДн)
+делает заказчик.
+
+| Требование | Что сделать | Где в проекте |
+|---|---|---|
+| Правовые основания (ст. 6) | Исполнение договора — оферта. Бухгалтерия и 54-ФЗ — обязанность по закону. Рассылка — только согласие | § 7.8 |
+| Согласие отдельным документом (ст. 9 ч. 1) | Отдельный текст и отдельная галочка, версия и хэш текста | `wp_book_user_consents` (`privacy`) |
+| Политика опубликована (ст. 18.1 ч. 2) | Страница политики и ссылка на неё в формах сбора | Витрина (†) |
+| **Локализация** (ст. 18 ч. 5) | ПДн граждан РФ первично записываются и хранятся в БД на территории РФ. Это касается MySQL-сервера магазина, бэкапов, staging и копий для разработчиков. Внешние сервисы за рубежом (почтовые SaaS, трекеры ошибок, аналитика) с ПДн — это трансграничная передача (ст. 12) с отдельным уведомлением РКН | Плагин не передаёт ПДн третьим лицам, кроме банка и ОФД (чек 54-ФЗ). Логи, аудит и алерты — без ПДн |
+| Уведомление РКН (ст. 22) | До начала обработки — уведомление об обработке. Об изменениях — не позднее 15-го числа следующего месяца | Организационно; список целей, категорий и сроков — таблица § 7.10.3 |
+| Инцидент с утечкой (ст. 21 ч. 3.1) | Уведомить РКН в течение 24 часов, о результатах расследования — в течение 72 часов | Аудит `wp_book_audit_log` и логи с `request_id` помогают восстановить объём утечки |
+| Запросы субъекта (ст. 14, 20) | Ответ — в 10 рабочих дней (продление — не больше 5 рабочих дней с мотивированным уведомлением) | Экспортер WordPress (§ 7.11) |
+| Отзыв согласия, достижение цели (ст. 21 ч. 4–5) | Прекратить обработку и уничтожить данные в 30 дней, если нет другого основания (договор, бухгалтерия) | Эрейзер и обезличивание по срокам (§ 7.11) |
+| Ответственный за обработку, меры защиты (ст. 18.1, 19, 22.1) | Приказ, модель угроз, уровень защищённости | Организационно; плагин даёт разграничение прав (§ 7.2) и журнал |
+
+Конкретные формулировки и сроки утверждает юрист заказчика: таблица фиксирует, какие требования влияют на
+код и инфраструктуру.
+
+### 7.10.2 GDPR — если магазин продаёт в ЕС
+
+Механизмы плагина те же, меняются основания и сроки:
+
+| Вопрос | GDPR |
+|---|---|
+| Основания | Договор — Art. 6(1)(b), бухгалтерия — 6(1)(c), рассылка — согласие 6(1)(a). Строка `privacy` в этом режиме означает ознакомление с уведомлением о конфиденциальности (Art. 13), а не согласие |
+| Права субъекта | Доступ и переносимость (Art. 15, 20) — экспортер. Удаление (Art. 17) — эрейзер; данные бухгалтерии остаются по исключению Art. 17(3)(b) |
+| Срок ответа | Один месяц (Art. 12(3)), продление — до двух месяцев |
+| Утечка | Уведомить надзорный орган в течение 72 часов (Art. 33) |
+| Хранение | Требования локализации нет, но передача за пределы ЕЭЗ регулируется главой V |
+
+### 7.10.3 Цели, места хранения и сроки
+
+| Данные | Где | Цель | Срок по умолчанию | Механизм |
 |---|---|---|---|---|
 | Аккаунт (email, имя, отчество) | `wp_users`, `wp_usermeta` | Вход, связь | Пока существует аккаунт | Удаление аккаунта (ядро удаляет всю usermeta) |
-| Профиль (телефон, адреса, B2B) | `wp_book_customer_profiles` | Автозаполнение | Пока существует аккаунт | Эрейзер или удаление пользователя → `DELETE` |
-| Контакты в заказе (email, телефон, адрес доставки) | `wp_book_orders` | Исполнение заказа, претензии | Закрытие заказа + `uniundata_retention_contact_days` (по умолчанию 730), раньше — по запросу на удаление или при удалении аккаунта | Этап 1 (§ 7.11) |
-| ФИО и платёжный адрес в заказе | `wp_book_orders` | Бухгалтерский документ | Срок хранения бухгалтерских документов юрисдикции: `uniundata_retention_accounting_years` (по умолчанию 10), с конца года документа | Этап 2 (§ 7.11) |
-| Согласия без IP | `wp_book_user_consents` | Доказательство заключения договора | Как у заказа (этап 2) | Строки остаются, `user_id` псевдонимный |
-| IP и хэш UA согласия | `wp_book_user_consents` | Вспомогательное доказательство | 180 дней | Ежедневное обнуление |
-| Резервы, корзины, продажи | свои таблицы | Бизнес-правила (лимит 3), учёт | Бессрочно | Персональных полей нет, только `user_id` |
-| Платежи | `wp_book_payments`, `wp_book_payment_events` | Сверка с банком, бухгалтерия | Как у заказа | Только `card_brand`, `card_last4`, payload без PAN, CVV и лишних PII |
-| Аудит | `wp_book_audit_log` | Безопасность, разбор инцидентов | Финансовые события — как у заказа, прочие — 2 года | Значения PII в `context` не пишутся по правилу кода |
-| Логи веб-сервера и PHP | вне БД | Эксплуатация | 14–30 дней | logrotate. Тела запросов checkout и webhook не логируются |
+| Профиль (телефон, адреса, реквизиты) | `wp_book_customer_profiles` | Автозаполнение | Пока существует аккаунт | Эрейзер или удаление пользователя → `DELETE` |
+| Контакты в заказе (email, телефон, адрес доставки) | `wp_book_orders` | Исполнение заказа, претензии | 730 дней после закрытия заказа (`uniundata_retention_contact_days`), раньше — по запросу или при удалении аккаунта | Этап 1, `pii_erased_at` (§ 7.11) |
+| ФИО и платёжный адрес в заказе | `wp_book_orders` | Бухгалтерский документ | `uniundata_retention_accounting_years` (заглушка — 10 лет; по 402-ФЗ ст. 29 — не менее 5 лет после отчётного года) | Этап 2 (§ 7.11) |
+| Согласия без IP | `wp_book_user_consents` | Доказательство заключения договора и согласия | Как у заказа | Строки остаются, `user_id` псевдонимный |
+| IP и хэш UA согласия | `wp_book_user_consents` | Вспомогательное доказательство | 180 дней (`uniundata_consent_ip_retention_days`) | Ежедневное обнуление |
+| Резервы, корзины, продажи | Свои таблицы | Лимит трёх попыток, учёт | Бессрочно | Персональных полей нет, только `user_id` |
+| Платежи и события банка | `wp_book_payments`, `wp_book_payment_events` | Сверка с банком, бухгалтерия | Как у заказа | Только `card_brand` и `card_last4`, payload без PAN, CVV и лишних ПДн |
+| Аудит | `wp_book_audit_log` | Безопасность, разбор инцидентов | Финансовые события — как у заказа, прочие — 2 года (архивирование не автоматизировано) | Значения ПДн в `context` не пишутся |
+| Логи Apache и PHP | Вне БД | Эксплуатация | 14–30 дней | logrotate; тела запросов checkout и webhook не логируются |
 
-Значения по умолчанию — технические заглушки. Конкретные сроки утверждает юрист или DPO под
-юрисдикцию магазина: сроки хранения первичных документов в разных странах — порядка 5–10 лет. Сроки
-задаются фильтрами, а ежедневная задача Action Scheduler `uniundata_privacy_retention` применяет их.
+Сроки по умолчанию — константы `Plugin::RETENTION_*`, они меняются фильтрами. Ежедневная задача
+`uniundata_privacy_retention` применяет их.
 
 Правила кода:
 
-- REST-ответы не раскрывают чужие данные. `GET /catalog/availability` не говорит, **кто**
-  зарезервировал экземпляр. Чужой заказ — 404.
-- Письма менеджерам содержат `public_order_id` и ссылку в админку, но не адрес и не телефон.
-- В `wp_book_audit_log.context` и в логах — `user_id`, ID сущностей и маскированные значения
-  (`i***@example.com`, `+49*******67`), не исходные PII.
-- Отправка писем пропускает адреса в зоне `.invalid` (маркер анонимизации, § 7.11).
+- REST-ответы не раскрывают чужие данные. `GET /catalog/availability` не сообщает, **кто** зарезервировал
+  экземпляр, чужой заказ — 404.
+- Письма менеджерам (`uniundata_order_needs_attention`, алерты синхронизации) содержат номер заказа и
+  статус, но не адрес и не телефон.
+- В `wp_book_audit_log.context` и в логах — только `user_id`, ID сущностей и маскированные значения.
+- После обезличивания (`pii_erased_at IS NOT NULL`) письма покупателю и контакты для чека возврата не
+  отправляются (`Scheduler::orderPaid()`, `PaymentService`), а REST не отдаёт заглушки из колонок
+  (`OrderController`, поле `pii_erased`).
 
-## 7.11 GDPR: экспорт и удаление персональных данных
+## 7.11 Экспорт и удаление по запросу субъекта
 
-Плагин встраивается в штатный механизм WordPress. Администратор создаёт запрос в «Инструменты →
-Экспорт / Удаление персональных данных», субъект подтверждает его по ссылке из письма, после чего ядро
-по очереди вызывает зарегистрированные экспортеры или эрейзеры с пагинацией (`$page`).
+Плагин встраивается в штатный механизм WordPress. Администратор создаёт запрос в «Инструменты → Экспорт /
+Удаление персональных данных», субъект подтверждает его по ссылке из письма, после чего ядро вызывает
+зарегистрированные экспортеры и эрейзеры. В мультисайте запрос обрабатывается на сайте магазина, потому что
+таблицы магазина принадлежат этому сайту.
 
 ### Экспорт (`wp_privacy_personal_data_exporters`)
 
-Ядро само экспортирует данные `wp_users` и стандартную usermeta. Плагин добавляет группы:
+Ядро само экспортирует `wp_users` и стандартную usermeta. Плагин добавляет:
 
-| Экспортер | Группа | Что входит |
+| Экспортер | Метод | Что входит |
 |---|---|---|
-| `uniundata-books-profile` | Профиль покупателя | `middle_name`, телефон, адреса по умолчанию, компания, VAT ID |
-| `uniundata-books-consents` | Согласия | Тип, версия, время, отзыв, IP (если ещё хранится) |
-| `uniundata-books-orders` | Заказы книг | Номер, статус, даты, суммы, снимок покупателя и адресов, книги, платежи (статус, сумма, бренд и last4) |
-| `uniundata-books-reservations` | Резервы | Книга, время резерва и окончания, статус |
+| `uniundata-books-profile` | `Plugin::exportProfile()` | `middle_name`, телефон, адреса по умолчанию, организация, ИНН/VAT ID; все согласия (тип, версия, время, отзыв, IP, если ещё хранится) |
+| `uniundata-books-orders` | `Plugin::exportOrders()` | По 50 заказов на страницу: номер, статус, даты, сумма, снимок покупателя и адресов, книги |
 
-```php
-<?php
-declare(strict_types=1);
+Историю резервов (книга, время, статус) экспортер пока не выгружает. Для полного ответа по ст. 14 152-ФЗ
+её стоит добавить третьим экспортером.
 
-namespace Uniundata\Books\Privacy;
+### Удаление (`wp_privacy_personal_data_erasers`): обезличивание, а не `DELETE`
 
-final class PersonalDataExporter
-{
-    private const PER_PAGE = 50;
-
-    public static function register(): void
-    {
-        add_filter('wp_privacy_personal_data_exporters', static function (array $exporters): array {
-            $exporters['uniundata-books-orders'] = [
-                'exporter_friendly_name' => __('Книжный магазин: заказы', 'uniundata-books'),
-                'callback'               => [self::class, 'exportOrders'],
-            ];
-            // …profile, consents, reservations регистрируются так же
-            return $exporters;
-        });
-    }
-
-    /** @return array{data: list<array<string, mixed>>, done: bool} */
-    public static function exportOrders(string $email, int $page = 1): array
-    {
-        global $wpdb;
-        $user = get_user_by('email', $email);
-        if (!$user instanceof \WP_User) {
-            return ['data' => [], 'done' => true]; // аккаунта нет — заказы уже обезличены
-        }
-        $page = max(1, $page);
-        $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT id, public_order_id, status, currency, total_amount, placed_at, paid_at,
-                    customer_email, customer_phone, customer_first_name, customer_last_name,
-                    customer_middle_name, billing_address_json, shipping_address_json
-               FROM {$wpdb->prefix}book_orders
-              WHERE user_id = %d
-              ORDER BY id
-              LIMIT %d OFFSET %d",
-            $user->ID,
-            self::PER_PAGE,
-            ($page - 1) * self::PER_PAGE
-        ), ARRAY_A);
-
-        $data = [];
-        foreach ($rows as $o) {
-            $titles = $wpdb->get_col($wpdb->prepare(
-                "SELECT title_snapshot FROM {$wpdb->prefix}book_order_items WHERE order_id = %d ORDER BY id",
-                (int) $o['id']
-            ));
-            $data[] = [
-                'group_id'    => 'uniundata-book-orders',
-                'group_label' => __('Заказы книг', 'uniundata-books'),
-                'item_id'     => 'book-order-' . $o['public_order_id'],
-                'data'        => [
-                    ['name' => __('Номер заказа', 'uniundata-books'), 'value' => $o['public_order_id']],
-                    ['name' => __('Статус', 'uniundata-books'), 'value' => $o['status']],
-                    ['name' => __('Оформлен (UTC)', 'uniundata-books'), 'value' => (string) $o['placed_at']],
-                    ['name' => __('Сумма', 'uniundata-books'),
-                     'value' => number_format(((int) $o['total_amount']) / 100, 2, '.', '') . ' ' . $o['currency']],
-                    ['name' => __('Покупатель', 'uniundata-books'), 'value' => trim(implode(' ', array_filter([
-                        $o['customer_last_name'], $o['customer_first_name'], $o['customer_middle_name'],
-                    ])))],
-                    ['name' => 'Email', 'value' => $o['customer_email']],
-                    ['name' => __('Телефон', 'uniundata-books'), 'value' => (string) $o['customer_phone']],
-                    ['name' => __('Адрес доставки', 'uniundata-books'), 'value' => self::address($o['shipping_address_json'])],
-                    ['name' => __('Платёжный адрес', 'uniundata-books'), 'value' => self::address($o['billing_address_json'])],
-                    ['name' => __('Книги', 'uniundata-books'), 'value' => implode('; ', $titles)],
-                ],
-            ];
-        }
-        return ['data' => $data, 'done' => count($rows) < self::PER_PAGE];
-    }
-
-    private static function address(?string $json): string
-    {
-        $a = $json === null ? null : json_decode($json, true);
-        if (!is_array($a)) {
-            return '';
-        }
-        unset($a['v']);
-        return implode(', ', array_filter(array_map('strval', $a), static fn (string $v): bool => $v !== ''));
-    }
-}
-```
-
-### Удаление (`wp_privacy_personal_data_erasers`): анонимизация, а не `DELETE`
-
-Заказы, позиции, платежи и продажи не удаляются: это бухгалтерские документы, и ТЗ запрещает удалять
-их строки. Эрейзер удаляет то, что можно удалить сразу, а остальное обезличивает в два этапа.
+Заказы, позиции, платежи и продажи — бухгалтерские документы, и ТЗ запрещает удалять их строки. Эрейзер
+`uniundata-books` (`Plugin::erasePersonalData()`) удаляет то, что можно удалить сразу, а остальное
+обезличивает в два этапа. **Аккаунт эрейзер не удаляет**: это отдельное действие администратора (§ 7.12).
+Полное исполнение требования «удалите мои данные» = эрейзер + удаление аккаунта.
 
 | Что | При запросе на удаление | Позже |
 |---|---|---|
 | `wp_book_customer_profiles` | `DELETE` | — |
 | usermeta `middle_name` | `delete_user_meta` | — |
-| Активные резервы и открытая корзина | Не трогаются, пока аккаунт существует: пользователь может продолжать покупки. При удалении аккаунта — снимаются (§ 7.12) | — |
-| Согласия `marketing` | `withdrawn_at = now` | — |
-| IP и хэш UA во всех согласиях | `NULL` сразу | — |
-| Закрытые заказы | **Этап 1:** email → `erased-<id>@invalid.invalid`, телефон → `NULL`, адрес доставки → только страна | **Этап 2** после срока хранения: ФИО → `Anonymized`, платёжный адрес и B2B → только страна |
-| Заказы в работе (`draft` … `paid`, `fulfilled`) | Не трогаются: нужны для исполнения | Этап 1 выполняет ежедневная задача, когда заказ закроется (по метке `uniundata_erasure_requested_at`) |
+| Активные резервы и открытая корзина | Не трогаются, пока аккаунт существует. При удалении аккаунта снимаются (§ 7.12) | — |
+| Согласия `marketing` | `withdrawn_at = UTC_TIMESTAMP(6)` | — |
+| IP и хэш UA во всех согласиях | `NULL` | — |
+| Закрытые заказы | **Этап 1**: email → `erased-<id>@invalid.invalid`, телефон → `NULL`, адрес доставки → только страна, `pii_erased_at = UTC_TIMESTAMP(6)` | **Этап 2** после бухгалтерского срока: ФИО → `Anonymized`, отчество → `NULL`, платёжный адрес → только страна |
+| Незакрытые заказы | Не трогаются: нужны для исполнения | Этап 1 выполнит ежедневная задача, когда заказ закроется (по метке `uniundata_erasure_requested_at`) |
 
-«Закрытый» заказ для целей PII — `status IN ('completed','refunded','cancelled','payment_expired')`
-или `status = 'partially_refunded' AND fulfilled_at IS NOT NULL`.
+**Закрытый заказ** для целей ПДн (`Plugin::CLOSED_ORDER_SQL`): статус `completed`, `refunded`,
+`cancelled` или `payment_expired` либо `partially_refunded` с `fulfilled_at IS NOT NULL`; при этом
+`needs_attention = 0` и нет возврата в статусе `requested` или `pending`. Пока менеджер разбирает заказ
+или банк проводит возврат, контакты покупателя нужны.
 
 ```sql
--- Этап 1: контакты (эрейзер, удаление аккаунта, ретенция contact_days). Идемпотентно.
-UPDATE wp_book_orders
-   SET customer_email = CONCAT('erased-', id, '@invalid.invalid'),
-       customer_phone = NULL,
-       shipping_address_json = IF(shipping_address_json IS NULL, NULL,
+-- Этап 1 (Plugin::eraseContacts): эрейзер, удаление аккаунта, ежедневный срок. Идемпотентно.
+UPDATE wp_book_orders o
+   SET o.customer_email = CONCAT('erased-', o.id, '@invalid.invalid'),
+       o.customer_phone = NULL,
+       o.shipping_address_json = IF(o.shipping_address_json IS NULL, NULL,
            JSON_OBJECT('v', 1, 'redacted', TRUE,
-                       'country_code', JSON_UNQUOTE(JSON_EXTRACT(shipping_address_json, '$.country_code'))))
- WHERE user_id = %d
-   AND (status IN ('completed', 'refunded', 'cancelled', 'payment_expired')
-        OR (status = 'partially_refunded' AND fulfilled_at IS NOT NULL))
-   AND customer_email NOT LIKE %s;            -- параметр 'erased-%@invalid.invalid'
-
--- Этап 2: бухгалтерский срок истёк (ежедневная задача, пакетами по 500)
-UPDATE wp_book_orders
-   SET customer_first_name = 'Anonymized', customer_last_name = 'Anonymized',
-       customer_middle_name = NULL,
-       customer_email = CONCAT('erased-', id, '@invalid.invalid'), customer_phone = NULL,
-       billing_address_json = IF(billing_address_json IS NULL, NULL,
-           JSON_OBJECT('v', 1, 'redacted', TRUE,
-                       'country_code', JSON_UNQUOTE(JSON_EXTRACT(billing_address_json, '$.country_code')))),
-       shipping_address_json = IF(shipping_address_json IS NULL, NULL,
-           JSON_OBJECT('v', 1, 'redacted', TRUE,
-                       'country_code', JSON_UNQUOTE(JSON_EXTRACT(shipping_address_json, '$.country_code'))))
- WHERE COALESCE(completed_at, cancelled_at, paid_at, placed_at, created_at)
-       < UTC_TIMESTAMP(6) - INTERVAL %d YEAR
-   AND customer_last_name <> 'Anonymized'
- LIMIT 500;
+                       'country', JSON_UNQUOTE(JSON_EXTRACT(o.shipping_address_json, '$.country')))),
+       o.pii_erased_at = UTC_TIMESTAMP(6)
+ WHERE o.user_id = %d
+   AND o.pii_erased_at IS NULL
+   AND (o.status IN ('completed', 'refunded', 'cancelled', 'payment_expired')
+        OR (o.status = 'partially_refunded' AND o.fulfilled_at IS NOT NULL))
+   AND o.needs_attention = 0
+   AND NOT EXISTS (SELECT 1 FROM wp_book_refunds rf
+                    WHERE rf.order_id = o.id AND rf.status IN ('requested', 'pending'));
 ```
 
-Оба запроса проверены на MySQL 8.0.46: CHECK-ограничения не мешают, а `customer_email NOT NULL` остаётся
-заполненным. Страна в адресах сохраняется: она нужна для налоговой отчётности по странам. Домен
-`.invalid` зарезервирован (RFC 2606), поэтому письмо на такой адрес уйти не может. Одиночный `UPDATE`
-трогает только `wp_book_orders` и других блокировок не держит, поэтому взаимной блокировки с checkout
-или webhook быть не может. Предикат по статусу в READ COMMITTED перепроверяется на заблокированной
-версии строки.
+Признак этапа 1 — колонка `pii_erased_at`, а не содержимое полей. `customer_email` объявлен `NOT NULL`,
+поэтому вместо адреса пишется заглушка в зарезервированной зоне `.invalid` (RFC 2606): письмо на неё уйти не
+может. Страна в адресе сохраняется для отчётности, ключ — `country`, как в `CheckoutRequest`. Запрос
+проверен на MySQL 8.0.46. Одиночный `UPDATE` трогает только `wp_book_orders` и `NOT EXISTS` по
+`wp_book_refunds`, других блокировок не держит, поэтому цикла ожидания с checkout или webhook не образует.
+Предикат по статусу в READ COMMITTED перепроверяется на заблокированной версии строки.
 
-> В схеме v1 признаком обезличивания служат сами значения (`erased-…@invalid.invalid`, `Anonymized`).
-> Чище и быстрее для ежедневной задачи — колонки `pii_redacted_at`/`anonymized_at` с индексом. Их стоит
-> добавить отдельной аддитивной миграцией.
+**Ежедневная задача** `uniundata_privacy_retention` (`Plugin::privacyRetention()`; вручную —
+`wp uniundata privacy-retention`) обрабатывает за запуск пакет по 500 строк на шаг:
 
-```php
-<?php
-declare(strict_types=1);
-
-namespace Uniundata\Books\Privacy;
-
-final readonly class RedactionResult
-{
-    public function __construct(
-        public bool $profileDeleted,
-        public int $ordersRedacted,
-        public int $ordersRetained,
-        public int $openOrders,
-        public int $consentsMinimized,
-    ) {}
-
-    public function removedAnything(): bool
-    {
-        return $this->profileDeleted || $this->ordersRedacted > 0 || $this->consentsMinimized > 0;
-    }
-}
-
-final class PersonalDataEraser
-{
-    public function __construct(private readonly PrivacyService $privacy) {}
-
-    public function register(): void
-    {
-        add_filter('wp_privacy_personal_data_erasers', function (array $erasers): array {
-            $erasers['uniundata-books'] = [
-                'eraser_friendly_name' => __('Книжный магазин', 'uniundata-books'),
-                'callback'             => [$this, 'erase'],
-            ];
-            return $erasers;
-        });
-    }
-
-    /** @return array{items_removed: bool, items_retained: bool, messages: list<string>, done: bool} */
-    public function erase(string $email, int $page = 1): array
-    {
-        $user = get_user_by('email', $email);
-        if (!$user instanceof \WP_User) {
-            return ['items_removed' => false, 'items_retained' => false, 'messages' => [], 'done' => true];
-        }
-        // Метка нужна ежедневной задаче: заказы, которые закроются позже, пройдут этап 1 автоматически.
-        update_user_meta($user->ID, 'uniundata_erasure_requested_at', gmdate('Y-m-d H:i:s'));
-        $r = $this->privacy->redactUser((int) $user->ID, 'erasure_request');
-
-        $messages = [];
-        if ($r->openOrders > 0) {
-            $messages[] = sprintf(
-                __('Заказов в работе: %d. Контактные данные в них будут удалены после завершения заказа.', 'uniundata-books'),
-                $r->openOrders
-            );
-        }
-        if ($r->ordersRetained > 0) {
-            $messages[] = sprintf(
-                __('Заказов, сохранённых для бухгалтерии: %d. ФИО и платёжный адрес будут обезличены по окончании срока хранения.', 'uniundata-books'),
-                $r->ordersRetained
-            );
-        }
-        return [
-            'items_removed'  => $r->removedAnything(),
-            'items_retained' => $r->openOrders > 0 || $r->ordersRetained > 0,
-            'messages'       => $messages,
-            'done'           => true,
-        ];
-    }
-}
-```
-
-`PrivacyService::redactUser()` выполняет `DELETE` профиля, удаляет `middle_name`, применяет
-минимизацию согласий и этап 1, затем пишет аудит `privacy.user_redacted` со счётчиками, без значений.
-Эрейзер **не удаляет аккаунт**: в WordPress это отдельное действие администратора (§ 7.12).
+1. Обнуляет IP и хэш UA в согласиях старше 180 дней (индекс `ix_consents_retention`).
+2. Выполняет этап 1 для закрытых заказов с `pii_erased_at IS NULL`, если: заказ не менялся дольше срока
+   контактов (`ix_orders_retention (pii_erased_at, status, updated_at)`), или аккаунта уже нет в
+   `wp_users`, или у пользователя есть метка `uniundata_erasure_requested_at`.
+3. Выполняет этап 2 для заказов с `pii_erased_at IS NOT NULL`, у которых истёк бухгалтерский срок,
+   считая от `COALESCE(completed_at, cancelled_at, paid_at, placed_at, created_at)`. Признак этапа 2 —
+   значение `Anonymized` в `customer_last_name`: отдельной колонки в схеме нет.
 
 ## 7.12 Удаление пользователя WordPress
 
-### Хуки
-
 | Ситуация | Хук | Что делает плагин |
 |---|---|---|
-| Одиночный сайт, «Пользователи → Удалить», `wp user delete`, `wp_delete_user()` | `delete_user` (до удаления строки и usermeta) | Снимает резервы, отменяет неоплаченные заказы, ставит задачу очистки |
-| Мультисайт, удаление из сети (`wpmu_delete_user()`) | `wpmu_delete_user` | То же для каждого сайта сети, где активен плагин (`switch_to_blog`): таблицы магазина у каждого сайта свои |
-| Мультисайт, «убрать с сайта» (`wp_delete_user()` / `remove_user_from_blog()`) | `delete_user` срабатывает, но аккаунт в сети остаётся | Ничего не делаем: пользователь существует, его заказы остаются его заказами |
-| Проверка прав на удаление (админка, `DELETE /wp/v2/users/{id}`) | `map_meta_cap` для `delete_user` | `do_not_allow`, если у пользователя есть заказы в `pending_payment`, `payment_processing` или `paid` (§ 7.4). Администратор сначала завершает или отменяет заказ |
+| Одиночный сайт: «Пользователи → Удалить», `wp user delete`, `wp_delete_user()` | `delete_user` (до удаления строки и usermeta) → `Plugin::onDeleteUser()` | Снимает резервы, закрывает корзину, отменяет неоплаченные заказы, ставит задачу очистки |
+| Мультисайт, удаление из сети (`wpmu_delete_user()`) | `wpmu_delete_user` → `Plugin::onDeleteNetworkUser()` | То же для каждого сайта сети, где активен плагин (`switch_to_blog`) |
+| Мультисайт, «убрать с сайта» | `delete_user` срабатывает, но аккаунт остаётся в сети | Ничего не делает: пользователь существует, его заказы остаются его заказами |
+| Проверка прав на удаление (админка, `DELETE /wp/v2/users/{id}`) | `map_meta_cap` для `delete_user` | `do_not_allow`, если у пользователя есть заказ в `pending_payment`, `payment_processing` или `paid` (§ 7.4). Администратор сначала завершает или отменяет заказ |
 
-`delete_user` не умеет отменять удаление: `wp_die()` в нём оставил бы полуудалённого пользователя.
-Поэтому блокировка удаления реализуется только через право `delete_user`. WP-CLI и прямой вызов
-`wp_delete_user()` права не проверяют, поэтому обработчик корректно работает при любом состоянии заказов.
-На мультисайте guard проверяет заказы только текущего сайта (в сетевой админке — основного), а
-обработчик `wpmu_delete_user` всё равно обходит все сайты.
+`delete_user` не умеет отменить удаление: `wp_die()` в нём оставил бы полуудалённого пользователя. Поэтому
+запрет реализован только через право `delete_user`. WP-CLI и прямой вызов `wp_delete_user()` права не
+проверяют, и обработчик (`Plugin::releaseUser()`) корректно работает при любом состоянии заказов:
 
-```php
-<?php
-declare(strict_types=1);
-
-namespace Uniundata\Books\Privacy;
-
-final class UserLifecycle
-{
-    public function __construct(private readonly PrivacyService $privacy) {}
-
-    public function register(): void
-    {
-        add_action('delete_user', [$this, 'onDeleteUser'], 10, 1);
-        add_action('wpmu_delete_user', [$this, 'onDeleteNetworkUser'], 10, 1);
-        add_action('uniundata_user_deleted_cleanup', [$this, 'cleanup'], 10, 1);
-    }
-
-    public function onDeleteUser(int $userId): void
-    {
-        if (is_multisite()) {
-            return; // на мультисайте это «убрать с сайта»: аккаунт в сети остаётся
-        }
-        $this->releaseAndSchedule($userId);
-    }
-
-    public function onDeleteNetworkUser(int $userId): void
-    {
-        // Таблицы магазина у каждого сайта свои: обходим все сайты, где плагин активен.
-        foreach (get_sites(['fields' => 'ids', 'number' => 0]) as $siteId) {
-            switch_to_blog((int) $siteId);
-            try {
-                if ($this->pluginActiveOnCurrentSite()) {
-                    $this->releaseAndSchedule($userId);
-                }
-            } finally {
-                restore_current_blog();
-            }
-        }
-    }
-
-    private function pluginActiveOnCurrentSite(): bool
-    {
-        $basename = plugin_basename(UNIUNDATA_BOOKS_FILE); // константа из главного файла плагина
-        return array_key_exists($basename, (array) get_site_option('active_sitewide_plugins', []))
-            || in_array($basename, (array) get_option('active_plugins', []), true);
-    }
-
-    private function releaseAndSchedule(int $userId): void
-    {
-        // Каждая операция — свои короткие транзакции с глобальным порядком блокировок.
-        $this->privacy->releaseActiveReservations($userId, 'user_deleted'); // cancelled + release target
-        $this->privacy->closeOpenCart($userId);                             // abandoned, closed_at
-        $this->privacy->cancelUnpaidOrders($userId, 'user_deleted');        // draft/pending_payment/payment_failed
-        // PII — после удаления строки wp_users, идемпотентно и с повтором Action Scheduler.
-        as_enqueue_async_action('uniundata_user_deleted_cleanup', ['user_id' => $userId], 'uniundata');
-    }
-
-    public function cleanup(int $userId): void
-    {
-        if (get_userdata($userId) !== false) {
-            return; // удаление не состоялось — данные не трогаем
-        }
-        $this->privacy->redactUser($userId, 'user_deleted'); // профиль, согласия, этап 1
-    }
-}
-```
-
-> На мультисайте у каждого сайта своя очередь Action Scheduler (таблицы с префиксом сайта). Поэтому
-> системный cron запускает `wp action-scheduler run --url=<сайт>` для каждого сайта сети.
-
-Итог удаления:
-
-- `wp_users` и вся usermeta — удалены ядром;
-- профиль — удалён, IP в согласиях — обнулён, маркетинговые согласия — отозваны;
-- активные резервы — `cancelled` с `release_reason = 'user_deleted'`, экземпляры освобождены по release
-  target. Корзина — `abandoned`;
-- неоплаченные заказы — `cancelled`, сессия банка отменяется задачей после `COMMIT`. Поздний платёж
-  по такому заказу обрабатывается общей веткой late payment (возврат или `needs_attention`);
-- оплаченные заказы, продажи и платежи остаются с прежним `user_id`. Закрытые заказы сразу проходят
-  этап 1, незакрытые — когда закроются: ежедневная задача находит заказы пользователей, которых нет в
-  `wp_users`, запросом ниже.
+1. Активные резервы — по одному, каждый в своей транзакции в глобальном порядке блокировок
+   (корзина → экземпляр → резерв): `cancelled` с `release_reason = 'user_deleted'`, экземпляр уходит в
+   release target.
+2. Открытая корзина → `abandoned`.
+3. Заказы в `draft`, `pending_payment` и `payment_failed` → `cancelled` (`CheckoutService::cancel()`),
+   сессии банка закрываются после `COMMIT`. `payment_processing` не трогается: ждём итог банка. Поздний
+   платёж по отменённому заказу обрабатывает общая ветка late payment (возврат или `needs_attention`).
+4. После удаления строки `wp_users` задача `uniundata_user_deleted_cleanup {user_id}` (без флага `unique`)
+   вызывает `Plugin::cleanupDeletedUser()`. Если пользователь всё-таки существует, она ничего не делает,
+   иначе удаляет профиль, отзывает маркетинговые согласия, обнуляет IP и выполняет этап 1 для закрытых
+   заказов. Незакрытые заказы обезличит ежедневная задача, когда они закроются.
 
 `user_id` в таблицах магазина **не обнуляется**. После удаления аккаунта это псевдоним, который ни на что
-не ссылается. Обнуление сломало бы ограничения: `UNIQUE(user_id, book_item_id, attempt_no)` в
-`wp_book_reservations` дал бы 1062 для двух удалённых пользователей, резервировавших один экземпляр.
-Повторного использования ID нет: в MySQL 8 счётчик AUTO_INCREMENT сохраняется между перезапусками.
+не ссылается. Обнуление сломало бы ограничения: `UNIQUE(user_id, book_item_id, attempt_no)` дал бы 1062 для
+двух удалённых пользователей, резервировавших один экземпляр. Повторного использования ID нет: в MySQL 8
+счётчик AUTO_INCREMENT сохраняется между перезапусками.
 
 ### Почему нет FOREIGN KEY на `wp_users`
 
-Краткая версия — в [03, раздел 9](03-tables-and-indexes.md#9-почему-нет-fk-на-wp_users). Здесь —
-с точки зрения жизненного цикла пользователя.
+Подробно — [03](03-tables-and-indexes.md) § 9. С точки зрения жизненного цикла пользователя:
 
-1. **Ядро удаляет пользователя, не зная о наших таблицах.** `wp_delete_user()` сначала удаляет
-   usermeta, затем строку `wp_users` обычным `DELETE`:
-   - с `RESTRICT` удаление упадёт на последнем шаге. Останется пользователь без метаданных и ролей,
-     а ошибку `$wpdb` администратор не увидит;
-   - с `CASCADE` пропадут заказы, продажи и платежи — бухгалтерские документы. Каскад к тому же
-     упрётся в `RESTRICT`-ключи между нашими таблицами;
-   - `SET NULL` несовместим с `user_id NOT NULL` и с уникальными ключами, где участвует `user_id`.
-2. **Движок `wp_users` не гарантирован.** FK требует InnoDB у обеих таблиц, а старые и перенесённые
-   сайты бывают с MyISAM в таблицах ядра. Плагин не должен менять движок таблиц ядра.
-3. **Мультисайт.** `wp_users` — общая таблица сети, а таблицы магазина — у каждого сайта
-   (`wp_2_book_orders`). Удаление из сети — не то же самое, что «убрать с сайта», и FK эту разницу не
-   выразит. При `CUSTOM_USER_TABLE` таблица пользователей вообще может быть общей для нескольких
-   установок WordPress.
-4. **Инструменты и операции** — миграция сайта, staging, `wp db import`, частичное восстановление
-   таблиц ядра — не должны спотыкаться о ссылки из таблиц плагина.
+1. **Ядро удаляет пользователя, не зная о наших таблицах.** С `RESTRICT` `wp_delete_user()` упадёт на
+   последнем шаге и оставит пользователя без метаданных и ролей. С `CASCADE` пропадут заказы, продажи и
+   платежи. `SET NULL` несовместим с `user_id NOT NULL` и с уникальными ключами.
+2. **Движок `wp_users` не гарантирован** (старые и перенесённые сайты бывают с MyISAM), а плагин не должен
+   менять таблицы ядра.
+3. **Мультисайт.** `wp_users` — общая таблица сети, таблицы магазина — у сайта (`wp_N_book_orders`).
+   Удаление из сети и «убрать с сайта» FK не различит.
+4. **Операции** — миграция сайта, staging, частичное восстановление таблиц ядра — не должны спотыкаться о
+   ссылки из таблиц плагина.
 
-Целостность обеспечивают хуки выше и ежедневная проверка `wp uniundata doctor`:
+Целостность обеспечивают хуки выше и проверки для `wp uniundata doctor`:
 
 ```sql
--- Заказы удалённых пользователей, ещё не прошедшие этап 1
+-- Заказы удалённых пользователей, ещё не прошедшие этап 1 (открытые ждут закрытия — это не ошибка)
 SELECT o.user_id, COUNT(*) AS orders_with_contacts
   FROM wp_book_orders o
   LEFT JOIN wp_users u ON u.ID = o.user_id
- WHERE u.ID IS NULL
-   AND o.customer_email NOT LIKE 'erased-%@invalid.invalid'
+ WHERE u.ID IS NULL AND o.pii_erased_at IS NULL
  GROUP BY o.user_id;
 
 -- Признак повторного использования ID (например, wp_users восстановлен из старого дампа):
@@ -942,22 +515,58 @@ SELECT o.id, o.user_id
  WHERE u.user_registered > o.created_at;
 ```
 
-`LEFT JOIN … WHERE u.ID IS NULL` выполняется через `eq_ref` по первичному ключу `wp_users`
-(«Not exists» в `EXPLAIN`). Для ежедневной задачи полного прохода по заказам достаточно, а с колонкой
-`pii_redacted_at` он сужается индексом. `wp_users.user_registered` WordPress пишет в UTC, как и
-`created_at` плагина.
+Первый запрос выполняется через `eq_ref` по первичному ключу `wp_users` (`Not exists` в `EXPLAIN`) и
+диапазон `ix_orders_retention` по `pii_erased_at IS NULL`. `wp_users.user_registered` WordPress пишет в
+UTC, как и `created_at` плагина.
 
-## 7.13 Что проверяют тесты
+## 7.13 Единый вход: new.libsmr.ru и shop.libsmr.ru
 
-- Гость: 401 на `/cart/reserve` и `/checkout`. `GET /catalog/availability` — 200 без cookie.
-- `book_catalog_manager` получает 403 на `/cart/reserve`. `book_customer` — 403 на `/admin/*`.
+Покупатель, у которого уже есть аккаунт на основном сайте new.libsmr.ru, может ожидать, что войдёт с ним и в
+магазин shop.libsmr.ru. Как это сделать, зависит от того, мультисайт это или две отдельные установки, а
+заказчик пока не ответил ([11](11-environment.md) § 11.3). Плагин от выбора не зависит: всё привязано к
+`wp_users.ID` сайта магазина.
+
+| Вариант | Как работает | Плюсы | Минусы и риски | Что нужно в плагине и на сервере |
+|---|---|---|---|---|
+| **А. Регистрация в магазине** (две установки) | Своя `wp_users` у магазина. Покупатель регистрируется на shop.libsmr.ru (`users_can_register = 1`, `default_role = book_customer`) | Нулевая связность: сбой или взлом основного сайта не затрагивает магазин. Отдельный круг администраторов, имеющих доступ к ПДн покупателей. Ничего не нужно разрабатывать | Два аккаунта и два пароля у человека, у которого есть аккаунт на основном сайте. Профиль не синхронизирован | Ничего сверх текущего кода. Подтверждение email при регистрации и защита формы от ботов |
+| **Б. Мультисайт с общей `wp_users`** | Магазин — сайт сети (домен shop.libsmr.ru привязан к сайту), таблицы магазина — `wp_N_book_*`, пользователи общие | Один аккаунт без дополнительного ПО. Удаление из сети уже обработано (`wpmu_delete_user`, § 7.12) | Сеть — единая точка отказа и общий периметр: плагин с уязвимостью на основном сайте открывает доступ к данным магазина, а суперадминистраторы сети видят покупателей. Cookie входа по умолчанию привязаны к домену, поэтому без `COOKIE_DOMAIN = '.libsmr.ru'` пользователь входит на каждом домене отдельно (тем же паролем). Общий cookie на `.libsmr.ru` уходит **всем** поддоменам — допустимо, только если все они под контролем заказчика и на HTTPS. Перевод двух существующих установок в мультисайт — отдельный рискованный проект | Пользователь сети без роли на сайте магазина получает 403. Нужен обработчик «первого визита»: вошедшему пользователю без роли на сайте магазина выдаётся `book_customer` (`add_user_to_blog()`, запись в аудит; суперадминистраторов не трогать). Плагин активируется только на сайте магазина, не на всю сеть. Cron — `wp --url=https://shop.libsmr.ru action-scheduler run` |
+| **В. SSO по OpenID Connect** (две установки) | Магазин — клиент OIDC (например, плагин OpenID Connect Generic Client). Провайдер — основной сайт (плагин OIDC-сервера) или отдельный IdP, размещённый в РФ (Keycloak). При первом входе в магазине создаётся локальный аккаунт, связанный с `sub` в usermeta | Один аккаунт, а установки остаются независимыми. Можно добавить вход через Яндекс ID или VK ID на стороне IdP | Ещё один компонент: при недоступности IdP вход в магазин невозможен (локальный пароль как резерв). Нужно разработать и сопровождать: `state`, `nonce`, PKCE, проверку `iss` и `aud`, строгие redirect URI, single logout. Связывать существующий локальный аккаунт по email можно только при `email_verified = true` от IdP, иначе возможен захват аккаунта. Удаление аккаунта у IdP не удаляет аккаунт в магазине — нужен регламент | Роль `book_customer` при создании локального аккаунта. Email и имя обновляются из claims при каждом входе. Удаление и обезличивание — по § 7.11–7.12 на стороне магазина |
+
+Варианты, которые не рекомендуем:
+
+- **Общая `wp_users` двух установок через `CUSTOM_USER_TABLE`.** Ядро это не поддерживает как штатный
+  сценарий: роли хранятся в usermeta с префиксом каждой установки, соли и cookie должны совпадать, и многие
+  плагины ломаются.
+- **Синхронизация пользователей копированием** между базами: два источника истины по паролю и email.
+
+**Рекомендация.**
+
+1. Если сайты уже работают как мультисайт (общая БД и `wp_users`) — вариант **Б**: плагин только на сайте
+   магазина, обработчик выдачи роли при первом визите. `COOKIE_DOMAIN = '.libsmr.ru'` включается, только
+   если все поддомены `libsmr.ru` принадлежат заказчику.
+2. Если это две установки — к запуску вариант **А** (регистрация в магазине). Вариант **В** — отдельным
+   этапом, если бизнесу нужен один аккаунт: в первую очередь сервер OIDC на new.libsmr.ru, а Keycloak — если
+   к входу добавятся другие сервисы. Две установки не стоит превращать в мультисайт ради единого входа.
+3. **152-ФЗ.** Если сайты принадлежат разным юрлицам, общие пользователи (вариант Б) или передача профиля
+   через OIDC (вариант В) — это передача ПДн другому оператору: нужны основание и согласие или поручение на
+   обработку, это отражается в политике. В варианте А такой передачи нет. Во всех вариантах сервер
+   с `wp_users` должен находиться в РФ (§ 7.10.1).
+
+## 7.14 Что проверяют тесты
+
+- Гость: 401 на `/cart/reserve` и `/checkout`; `GET /catalog/availability` — 200 без cookie.
+- `book_catalog_manager` получает 403 на `/cart/reserve`, `book_customer` — 403 на `/admin/*`.
 - `current_user_can('view_book_order', $id)`: владелец — `true`; другой покупатель — `false` и 404 в REST;
   `book_order_manager` — `true`; `book_catalog_manager` — `false`.
-- `Roles::install()` дважды подряд не меняет `wp_user_roles`. Увеличение `VERSION` с удалённой из
-  карты capability снимает её только у ролей плагина.
-- Удаление пользователя с `pending_payment` из админки запрещено (`delete_user` → `do_not_allow`).
-  Удаление через `wp user delete` снимает резервы, отменяет неоплаченные заказы, а задача очистки
-  проводит этап 1. Строки заказов и продаж остаются.
-- Эрейзер: профиль удалён, IP в согласиях — `NULL`, закрытые заказы — `erased-…@invalid.invalid`,
-  заказ в `paid` не изменён, в ответе `items_retained = true` и сообщение.
-- Экспортер постранично возвращает все заказы (`done = false` до последней страницы).
+- Блокировка экземпляра в чужой корзине без `manage_book_reservations` — 403, экземпляр в
+  `checkout_pending` — 409.
+- `Roles::install()` дважды подряд не меняет `wp_user_roles`. Увеличение `VERSION` с удалённой из карты
+  capability снимает её только у ролей плагина.
+- Удаление пользователя с заказом в `pending_payment` из админки запрещено (`delete_user` →
+  `do_not_allow`). `wp user delete` снимает резервы и отменяет неоплаченные заказы, а задача очистки
+  выполняет этап 1. Строки заказов и продаж остаются.
+- Эрейзер: профиль удалён, IP в согласиях — `NULL`, у закрытых заказов заполнен `pii_erased_at` и в адресе
+  осталась только страна (`country`); заказ в `paid` не изменён, `items_retained = true` и сообщение.
+- Checkout с устаревшей версией оферты или согласия — 409 `uniundata_terms_outdated`; в каждом заказе
+  есть строки `offer` и `privacy` с IP или `NULL`.
+- Экспортер заказов постранично возвращает все заказы (`done = false` до последней страницы).

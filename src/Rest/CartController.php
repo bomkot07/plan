@@ -12,7 +12,11 @@ use Uniundata\Books\Service\ReservationService;
  *
  *   GET  /cart              — открытая корзина (только чтение: срок резерва НЕ продлевается);
  *   POST /cart/reserve      — резерв экземпляра на 1 час (201 — создан, 200 — уже ваш активный резерв);
- *   POST /cart/remove-item  — удаление из корзины: резерв → cancelled, экземпляр снова доступен.
+ *                             409 uniundata_item_unavailable (data.reason = 'currency' — цена не в валюте
+ *                             магазина), 409 uniundata_reservation_limit_reached (3 попытки на экземпляр),
+ *                             409 uniundata_active_reservation_limit (option uniundata_max_active_reservations);
+ *   POST /cart/remove-item  — удаление из корзины: резерв → cancelled, экземпляр → release target
+ *                             (available | sync_missing | withdrawn по source_status).
  *
  * Аутентификация: cookie + X-WP-Nonce (wp_rest) из браузера или Application Password. Без nonce
  * WordPress считает cookie-запрос анонимным → 401 uniundata_auth_required (data.reason = missing_nonce).

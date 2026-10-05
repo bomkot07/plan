@@ -23,7 +23,9 @@ enum PaymentStatus: string
     public function allowedTransitions(): array
     {
         return match ($this) {
-            self::Created => [self::Pending, self::Failed],
+            // Сессия у банка не открылась или заказ закрыт раньше: cancelled (отмена, сбой createSession)
+            // или expired (истёк payment_due_at). failed — только ответ банка по открытой сессии.
+            self::Created => [self::Pending, self::Cancelled, self::Expired],
             self::Pending => [self::Processing, self::Succeeded, self::Failed, self::Cancelled, self::Expired],
             self::Processing => [self::Succeeded, self::Failed, self::Expired],
             self::Succeeded => [self::Refunded, self::PartiallyRefunded],
@@ -45,7 +47,7 @@ enum PaymentStatus: string
         return \in_array($this, [self::Created, self::Pending, self::Processing], true);
     }
 
-    /** Деньги были получены; в БД требует succeeded_at (ck_payments_succeeded). */
+    /** Деньги были получены; в БД требует succeeded_at (wp_book_payments_chk_succeeded). */
     public function isSuccessful(): bool
     {
         return \in_array($this, [self::Succeeded, self::Refunded, self::PartiallyRefunded], true);

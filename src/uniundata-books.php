@@ -4,7 +4,7 @@
  * Description:       Магазин уникальных экземпляров книг: каталог MARC 21 с ежедневной синхронизацией, резерв на 1 час, корзина, заказы и банковская оплата.
  * Version:           1.0.0
  * Requires at least: 7.1
- * Requires PHP:      8.4
+ * Requires PHP:      8.3
  * Author:            Uniundata
  * License:           GPL-2.0-or-later
  * License URI:       https://www.gnu.org/licenses/gpl-2.0.html
@@ -18,8 +18,9 @@
  *     sql/schema.sql             ← каноническая схема, её выполняет Install\Migrator
  *     vendor/                    ← composer install --no-dev -o (autoload + woocommerce/action-scheduler)
  *
+ * Целевое окружение: PHP 8.3+ (у заказчика 8.3.27; код совместим и с 8.4), MySQL 8.0.16+ (InnoDB).
  * Синтаксис этого файла намеренно простой: на старом PHP WordPress должен показать сообщение
- * «требуется PHP 8.4» (по заголовку Requires PHP), а не упасть с ParseError.
+ * «требуется PHP 8.3» (по заголовку Requires PHP), а не упасть с ParseError.
  */
 
 declare(strict_types=1);

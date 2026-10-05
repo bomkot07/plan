@@ -7,25 +7,33 @@ namespace Uniundata\Books\Service;
 use Uniundata\Books\Domain\DomainError;
 use Uniundata\Books\Infrastructure\AuditLog;
 use Uniundata\Books\Infrastructure\Db;
+use Uniundata\Books\Payment\FiscalReceipt;
 use Uniundata\Books\Payment\PaymentProviderInterface;
 use Uniundata\Books\Payment\ProviderPaymentResult;
+use Uniundata\Books\Payment\ProviderRefundResult;
 use Uniundata\Books\Payment\WebhookResult;
 
 /**
- * Приём webhook-ов банка и применение результата платежа (общий путь для webhook и опроса банка).
+ * Приём webhook-ов банка, применение результата платежа (общий путь для webhook и опроса банка) и возвраты.
  *
  * Факт оплаты — ТОЛЬКО серверное подтверждение: webhook с проверенной подписью (и, если включено,
  * подтверждённый server-to-server запросом fetchPayment) или ответ API банка при опросе cron-ом.
  * Return URL браузера оплату не подтверждает.
  *
- * Порядок блокировок в applyProviderResult (контракт): items (asc) → orders → payments → payment_events.
+ * Возвраты: решение (duplicate_payment, late_payment_conflict, решение менеджера) = INSERT в wp_book_refunds
+ * со статусом requested В ТОЙ ЖЕ транзакции; после COMMIT — задача Action Scheduler uniundata_refund_payment
+ * {refund_id} → processRefund(): запрос к банку вне транзакции с idempotency_key возврата, затем
+ * requested → pending|succeeded|failed. На succeeded — payments.refunded_amount, а для основного платежа
+ * заказа ещё orders.refunded_amount и статусы partially_refunded|refunded.
+ *
+ * Порядок блокировок (docs/08): items (asc) → orders → payments → payment_events → refunds.
  * Побочные эффекты (письма, документы, возвраты, уведомления) — только после COMMIT через Action Scheduler.
  */
 final class PaymentService
 {
     /** Action Scheduler: письмо/документы по оплаченному заказу. Обработчик: fn (int $orderId). */
     public const HOOK_ORDER_PAID = 'uniundata_order_paid';
-    /** Возврат денег. Обработчик: fn (int $paymentId, int $amount, string $reason). */
+    /** Возврат денег. Обработчик: fn (int $refundId) => PaymentService::processRefund($refundId). */
     public const HOOK_REFUND = 'uniundata_refund_payment';
     /** Уведомление менеджеру о needs_attention. Обработчик: fn (int $orderId, string $reason). */
     public const HOOK_ATTENTION = 'uniundata_order_needs_attention';
@@ -35,19 +43,17 @@ final class PaymentService
     public const SIGNATURE_TOLERANCE_SECONDS = 300;
     private const MAX_BODY_BYTES = 65536;
 
-    /** Платёж: допустимые исходные статусы для целевого (контракт). */
+    /** Платёж: допустимые исходные статусы для целевого (контракт v2). Возвраты — completeRefundLocked(). */
     private const PAYMENT_FROM = [
         'pending' => ['created'],
         'processing' => ['pending'],
         'succeeded' => ['pending', 'processing', 'failed', 'expired', 'cancelled'],
-        'failed' => ['created', 'pending', 'processing'],
-        'cancelled' => ['pending'],
-        'expired' => ['pending', 'processing'],
-        'refunded' => ['succeeded', 'partially_refunded'],
-        'partially_refunded' => ['succeeded'],
+        'failed' => ['pending', 'processing'],
+        'cancelled' => ['created', 'pending'],
+        'expired' => ['created', 'pending', 'processing'],
     ];
 
-    /** Заказ: допустимые исходные статусы для целевого (контракт). */
+    /** Заказ: допустимые исходные статусы для целевого (контракт v2). */
     private const ORDER_FROM = [
         'pending_payment' => ['draft', 'payment_failed'],
         'payment_processing' => ['pending_payment'],
@@ -61,8 +67,13 @@ final class PaymentService
     private const MONEY_RECEIVED = ['succeeded', 'refunded', 'partially_refunded'];
     /** Свободный экземпляр для позднего платежа (плюс: нет активного резерва). */
     private const FREE_ITEM_STATUSES = ['available', 'sync_missing', 'withdrawn'];
+    /** Причины разбора, которые держат заказ от автозакрытия: менее важные причины их не перетирают. */
+    private const BLOCKING_ATTENTION = ['amount_mismatch', 'reference_mismatch'];
+    /** Возвраты по решению менеджера (requestRefund). Автоматические: duplicate_payment, late_payment_conflict. */
+    private const MANUAL_REFUND_REASONS = ['order_cancelled', 'customer_return', 'manual'];
+    /** Незавершённый возврат старше суток — needs_attention 'refund_stuck' (опрос банка продолжается). */
+    private const REFUND_STUCK_SECONDS = 86400;
 
-    private \wpdb $wpdb;
     /** @var list<array{0: string, 1: array<string, int|string>}> Задачи Action Scheduler после COMMIT. */
     private array $afterCommit = [];
     /** @var list<array<string, mixed>> Сессии банка, которые закрываются после COMMIT (best effort). */
@@ -76,9 +87,7 @@ final class PaymentService
         private readonly PaymentProviderInterface $provider,
         /** Подтверждать succeeded/processing/refund из webhook запросом fetchPayment (вне транзакции). */
         private readonly bool $confirmWithApi = true,
-        ?\wpdb $wpdb = null,
     ) {
-        $this->wpdb = $wpdb ?? $GLOBALS['wpdb'];
     }
 
     // =================================================================================================
@@ -94,7 +103,7 @@ final class PaymentService
      */
     public function handleWebhook(string $rawBody, array $headers): WebhookResult
     {
-        if (strlen($rawBody) > self::MAX_BODY_BYTES) {
+        if (\strlen($rawBody) > self::MAX_BODY_BYTES) {
             return WebhookResult::badRequest('body too large', 413);
         }
         $headers = array_change_key_case($headers, CASE_LOWER);
@@ -106,7 +115,7 @@ final class PaymentService
             $this->noteRejectedWebhook($e->errorCode());
 
             return WebhookResult::invalidSignature();
-        } catch (\InvalidArgumentException $e) {
+        } catch (\InvalidArgumentException) {
             $this->noteRejectedWebhook('unparseable_payload');
 
             return WebhookResult::badRequest('payload rejected');
@@ -121,7 +130,7 @@ final class PaymentService
             return WebhookResult::badRequest('provider mismatch');
         }
 
-        // 2. Inbox: идемпотентность по (provider, provider_event_id). Автокоммит, вне транзакции.
+        // 2. Inbox: идемпотентность по (provider, provider_event_id).
         $eventId = $this->storeEvent($event, $rawBody);
         $state = $this->scalar(
             'SELECT processing_status FROM %i WHERE id = %d',
@@ -134,7 +143,7 @@ final class PaymentService
 
         // 3. Подтверждение у банка server-to-server (вне транзакции).
         $result = $event;
-        if ($this->confirmWithApi && in_array($event->status->value, ['succeeded', 'processing', 'refunded', 'partially_refunded'], true)) {
+        if ($this->confirmWithApi && \in_array($event->status->value, ['succeeded', 'processing', 'refunded', 'partially_refunded'], true)) {
             $payment = $this->locatePayment($event);
             if ($payment !== null) {
                 try {
@@ -142,7 +151,7 @@ final class PaymentService
                         $payment['provider_payment_id'] ?? $event->providerPaymentId,
                         (string) $payment['idempotency_key']
                     );
-                } catch (\RuntimeException $e) {
+                } catch (\RuntimeException) {
                     $this->markEventFailed($eventId, 'provider_api_unavailable');
 
                     return WebhookResult::retryLater($eventId, 'provider api unavailable');
@@ -155,7 +164,7 @@ final class PaymentService
                 // Успех из webhook, который API ещё не подтверждает (лаг банка или подделка при утечке ключа):
                 // не применяем и НЕ помечаем ignored — иначе повторная доставка станет дублем и успех потеряется.
                 if ($event->status->value === 'succeeded'
-                    && !in_array($fresh->status->value, ['succeeded', 'refunded', 'partially_refunded'], true)) {
+                    && !\in_array($fresh->status->value, self::MONEY_RECEIVED, true)) {
                     $this->markEventFailed($eventId, 'success_not_confirmed_by_api');
 
                     return WebhookResult::retryLater($eventId, 'success not confirmed by provider api');
@@ -172,7 +181,7 @@ final class PaymentService
             // deadlock после повторов (503 conflict_retry), CHECK/UNIQUE (ошибка логики) и т.п.:
             // событие failed, банк повторит доставку — guard IN ('received','failed') позволит переобработку.
             $this->markEventFailed($eventId, $e instanceof DomainError ? $e->errorCode() : 'apply_failed: ' . $e::class);
-            error_log(sprintf('[uniundata] webhook event #%d failed: %s', $eventId, $e::class));
+            error_log(\sprintf('[uniundata] webhook event #%d failed: %s', $eventId, $e::class));
 
             return WebhookResult::retryLater($eventId, 'apply failed', $e instanceof DomainError ? 503 : 500);
         }
@@ -236,18 +245,427 @@ final class PaymentService
                 $out[$k] = '[redacted]';
                 continue;
             }
-            if (is_array($v)) {
+            if (\is_array($v)) {
                 $out[$k] = self::redact($v, $depth + 1);
-            } elseif (is_string($v)) {
+            } elseif (\is_string($v)) {
                 $v = (string) preg_replace('/\b(?:\d[ -]?){12,18}\d\b/', '[pan-redacted]', $v);
                 $v = (string) preg_replace('/[^\s@]+@[^\s@]+\.[^\s@]+/', '[email-redacted]', $v);
                 $out[$k] = mb_substr($v, 0, 500);
-            } elseif (is_int($v) || is_float($v) || is_bool($v) || $v === null) {
+            } elseif (\is_int($v) || \is_float($v) || \is_bool($v) || $v === null) {
                 $out[$k] = $v;
             }
         }
 
         return $out;
+    }
+
+    // =================================================================================================
+    // Возвраты
+    // =================================================================================================
+
+    /**
+     * Возврат по решению менеджера (отмена оплаченного заказа, возврат книги, ручной). Экземпляр остаётся
+     * sold: возврат денег не возвращает книгу в продажу. Блокировки: orders → payments → refunds.
+     *
+     * @param ?int $paymentId Null — основной платёж заказа.
+     * @return int wp_book_refunds.id; сам запрос к банку — задача uniundata_refund_payment после COMMIT.
+     */
+    public function requestRefund(int $orderId, int $amount, string $reason, int $managerId, ?int $paymentId = null): int
+    {
+        if (!\in_array($reason, self::MANUAL_REFUND_REASONS, true)) {
+            throw DomainError::invalidParam('reason', \__('Unknown refund reason.', 'uniundata-books'));
+        }
+        if ($amount <= 0) {
+            throw DomainError::invalidParam('amount', \__('Refund amount must be positive.', 'uniundata-books'));
+        }
+        $t = $this->tables();
+        $refundId = $this->db->transaction(function () use ($t, $orderId, $amount, $reason, $managerId, $paymentId): int {
+            $this->resetTxState('admin', null);
+            $order = $this->lockOrder($orderId);
+            if ($order === null) {
+                throw DomainError::orderNotFound();
+            }
+            $payments = $this->rowsById(
+                'SELECT id, attempt_no, status, amount, refunded_amount, currency, provider_payment_id, idempotency_key
+                   FROM %i WHERE order_id = %d ORDER BY id FOR UPDATE',
+                $t['payments'],
+                $orderId
+            );
+            $pid = $paymentId ?? $this->primaryPaymentId($orderId, $payments);
+            $p = $pid !== null ? ($payments[$pid] ?? null) : null;
+            if ($p === null || !\in_array($p['status'], ['succeeded', 'partially_refunded'], true) || $p['provider_payment_id'] === null) {
+                throw DomainError::invalidParam('payment_id', \__('This payment cannot be refunded.', 'uniundata-books'));
+            }
+
+            return $this->createRefundLocked($order, $p, $amount, $reason, $managerId);
+        });
+        $this->enqueueAfterCommit();
+
+        return $refundId;
+    }
+
+    /**
+     * Обработчик задачи uniundata_refund_payment {refund_id}. Идемпотентен: финальный возврат — no-op;
+     * requested/pending — запрос к банку с тем же idempotency_key (повтор возвращает тот же возврат).
+     * Пока результат не финальный, ставит себе следующий запуск (AS, растущий интервал).
+     *
+     * @return string Статус возврата после обработки: requested|pending|succeeded|failed.
+     */
+    public function processRefund(int $refundId): string
+    {
+        $t = $this->tables();
+        $ref = $this->row('SELECT id, order_id, payment_id, status FROM %i WHERE id = %d', $t['refunds'], $refundId);
+        if ($ref === null) {
+            throw new \InvalidArgumentException(\sprintf('Refund #%d not found', $refundId));
+        }
+        if (\in_array($ref['status'], ['succeeded', 'failed'], true)) {
+            return (string) $ref['status'];
+        }
+        $orderId = (int) $ref['order_id'];
+        $paymentId = (int) $ref['payment_id'];
+
+        // Tx1 (orders → payments → refunds): перепроверка под блокировкой и данные для банка.
+        $job = $this->db->transaction(function () use ($refundId, $orderId, $paymentId): array {
+            $this->resetTxState('system', null);
+
+            return $this->loadRefundJobTx($refundId, $orderId, $paymentId);
+        });
+        $this->enqueueAfterCommit();
+        if (!\in_array($job['status'], ['requested', 'pending'], true)) {
+            return (string) $job['status'];
+        }
+
+        // HTTP — вне транзакции. Ключ возврата делает повтор вызова безопасным.
+        try {
+            $res = $this->provider->refund(
+                (string) $job['provider_payment_id'],
+                (int) $job['amount'],
+                (string) $job['currency'],
+                (string) $job['idempotency_key'],
+                $this->refundReceipt($orderId, $paymentId, (int) $job['amount'])
+            );
+        } catch (\RuntimeException $e) {
+            error_log(\sprintf('[uniundata] refund #%d: provider call failed: %s', $refundId, $e::class));
+            $this->scheduleRefundFollowUp($refundId, (int) $job['age_seconds']);
+
+            return (string) $job['status'];
+        }
+
+        // Tx2: requested|pending → pending|succeeded|failed.
+        $status = $this->db->transaction(function () use ($refundId, $orderId, $paymentId, $res): string {
+            $this->resetTxState('system', null);
+
+            return $this->applyRefundResultTx($refundId, $orderId, $paymentId, $res);
+        });
+        $this->enqueueAfterCommit();
+        if ($status === 'pending') {
+            $this->scheduleRefundFollowUp($refundId, (int) $job['age_seconds']);
+        }
+
+        return $status;
+    }
+
+    /** @return array<string, mixed> */
+    private function loadRefundJobTx(int $refundId, int $orderId, int $paymentId): array
+    {
+        $t = $this->tables();
+        $order = $this->lockOrder($orderId);
+        $payment = $this->row(
+            'SELECT id, status, amount, refunded_amount, currency, provider_payment_id FROM %i WHERE id = %d FOR UPDATE',
+            $t['payments'],
+            $paymentId
+        );
+        $refund = $this->row(
+            'SELECT id, status, amount, currency, reason, idempotency_key,
+                    TIMESTAMPDIFF(SECOND, requested_at, UTC_TIMESTAMP(6)) AS age_seconds
+               FROM %i WHERE id = %d FOR UPDATE',
+            $t['refunds'],
+            $refundId
+        );
+        if ($order === null || $payment === null || $refund === null) {
+            throw new \RuntimeException('order/payment/refund vanished');
+        }
+        if (!\in_array($refund['status'], ['requested', 'pending'], true)) {
+            return ['status' => (string) $refund['status']];
+        }
+        if ($payment['provider_payment_id'] === null || !\in_array($payment['status'], self::MONEY_RECEIVED, true)) {
+            // Через API банка этот возврат не провести: закрываем как failed, решение — за менеджером.
+            $this->failRefundLocked($refund, $order, 'payment_not_refundable', null);
+
+            return ['status' => 'failed'];
+        }
+        if ((int) $refund['age_seconds'] >= self::REFUND_STUCK_SECONDS) {
+            $this->flagOrder($order, 'refund_stuck', ['refund_id' => $refundId]);
+        }
+
+        return [
+            'status' => (string) $refund['status'],
+            'amount' => (int) $refund['amount'],
+            'currency' => (string) $refund['currency'],
+            'idempotency_key' => (string) $refund['idempotency_key'],
+            'provider_payment_id' => (string) $payment['provider_payment_id'],
+            'age_seconds' => (int) $refund['age_seconds'],
+        ];
+    }
+
+    private function applyRefundResultTx(int $refundId, int $orderId, int $paymentId, ProviderRefundResult $res): string
+    {
+        $t = $this->tables();
+        $order = $this->lockOrder($orderId);
+        $payments = $this->rowsById(
+            'SELECT id, attempt_no, status, amount, refunded_amount, currency, provider_payment_id, idempotency_key
+               FROM %i WHERE order_id = %d ORDER BY id FOR UPDATE',
+            $t['payments'],
+            $orderId
+        );
+        $refund = $this->row(
+            'SELECT id, status, amount, provider_refund_id FROM %i WHERE id = %d FOR UPDATE',
+            $t['refunds'],
+            $refundId
+        );
+        if ($order === null || $refund === null || !isset($payments[$paymentId])) {
+            throw new \RuntimeException('order/payment/refund vanished');
+        }
+        $from = (string) $refund['status'];
+        if (!\in_array($from, ['requested', 'pending'], true)) {
+            return $from; // webhook возврата успел раньше
+        }
+
+        if ($res->status === ProviderRefundResult::SUCCEEDED) {
+            $this->completeRefundLocked($refund, $order, $payments, $paymentId, $res->providerRefundId);
+
+            return 'succeeded';
+        }
+        if ($res->status === ProviderRefundResult::FAILED) {
+            $this->failRefundLocked($refund, $order, $res->failureMessage ?? 'provider_declined', $res->providerRefundId);
+
+            return 'failed';
+        }
+        $this->exec(
+            "UPDATE %i SET provider_refund_id = COALESCE(provider_refund_id, %s), status = 'pending'
+              WHERE id = %d AND status IN ('requested', 'pending')",
+            $t['refunds'],
+            $res->providerRefundId,
+            $refundId
+        );
+        if ($from === 'requested') {
+            $this->audit->record('refund.status_changed', 'refund', $refundId, 'requested', 'pending', ['order_id' => $orderId], $this->actor);
+        }
+
+        return 'pending';
+    }
+
+    /**
+     * Решение о возврате: строка requested в той же транзакции. Вызывающий держит блокировки заказа
+     * и платежа; здесь берётся последний уровень (refunds этого платежа).
+     *
+     * @param array<string, mixed> $order
+     * @param array<string, mixed> $payment
+     */
+    private function createRefundLocked(array $order, array $payment, int $amount, string $reason, ?int $requestedBy, bool $enqueue = true): int
+    {
+        $t = $this->tables();
+        $reserved = (int) $this->scalar(
+            "SELECT COALESCE(SUM(amount), 0) FROM %i WHERE payment_id = %d AND status <> 'failed' FOR UPDATE",
+            $t['refunds'],
+            (int) $payment['id']
+        );
+        if ($amount <= 0 || $reserved + $amount > (int) $payment['amount']) {
+            throw DomainError::invalidParam('amount', \__('Refund amount exceeds the refundable balance.', 'uniundata-books'));
+        }
+        $this->exec(
+            "INSERT INTO %i (payment_id, order_id, amount, currency, reason, idempotency_key, status, requested_by, requested_at)
+             VALUES (%d, %d, %d, %s, %s, %s, 'requested', NULLIF(%d, 0), UTC_TIMESTAMP(6))",
+            $t['refunds'],
+            (int) $payment['id'],
+            (int) $order['id'],
+            $amount,
+            (string) $payment['currency'],
+            $reason,
+            wp_generate_uuid4(),
+            $requestedBy ?? 0
+        );
+        $refundId = $this->db->lastInsertId();
+        $this->audit->record('refund.requested', 'refund', $refundId, null, 'requested', [
+            'order_id' => (int) $order['id'], 'payment_id' => (int) $payment['id'], 'amount' => $amount, 'reason' => $reason,
+            'event_id' => $this->currentEventId,
+        ], $this->actor, $requestedBy);
+        if ($enqueue) {
+            $this->afterCommit[] = [self::HOOK_REFUND, ['refund_id' => $refundId]];
+        }
+
+        return $refundId;
+    }
+
+    /**
+     * Возврат прошёл: refund → succeeded; payments.refunded_amount += amount (succeeded → partially_refunded |
+     * refunded); для основного платежа — orders.refunded_amount и статус заказа.
+     *
+     * @param array<string, mixed>             $refund  Заблокированная строка возврата.
+     * @param array<string, mixed>             $order
+     * @param array<int, array<string, mixed>> $payments
+     */
+    private function completeRefundLocked(array $refund, array &$order, array &$payments, int $paymentId, ?string $providerRefundId): void
+    {
+        $t = $this->tables();
+        $refundId = (int) $refund['id'];
+        $amount = (int) $refund['amount'];
+        $this->expectAffected($this->exec(
+            "UPDATE %i
+                SET provider_refund_id = COALESCE(provider_refund_id, NULLIF(%s, '')), completed_at = UTC_TIMESTAMP(6),
+                    failure_message = NULL, status = 'succeeded'
+              WHERE id = %d AND status IN ('requested', 'pending')",
+            $t['refunds'],
+            $providerRefundId ?? '',
+            $refundId
+        ), 1, 'refund → succeeded');
+        $this->audit->record('refund.status_changed', 'refund', $refundId, (string) $refund['status'], 'succeeded', [
+            'order_id' => (int) $order['id'], 'payment_id' => $paymentId, 'amount' => $amount, 'event_id' => $this->currentEventId,
+        ], $this->actor);
+
+        // Платёж.
+        $p = &$payments[$paymentId];
+        $payFrom = (string) $p['status'];
+        if (!\in_array($payFrom, ['succeeded', 'partially_refunded'], true)) {
+            throw new \LogicException(\sprintf('Refund #%d for payment #%d in status %s', $refundId, $paymentId, $payFrom));
+        }
+        $refundedNow = (int) $p['refunded_amount'] + $amount;
+        $payTo = $refundedNow >= (int) $p['amount'] ? 'refunded' : 'partially_refunded';
+        $this->expectAffected($this->exec(
+            'UPDATE %i SET refunded_amount = refunded_amount + %d, status = %s
+              WHERE id = %d AND status = %s AND refunded_amount = %d',
+            $t['payments'],
+            $amount,
+            $payTo,
+            $paymentId,
+            $payFrom,
+            (int) $p['refunded_amount']
+        ), 1, "payment refund $payFrom → $payTo");
+        $this->audit->record('payment.status_changed', 'payment', $paymentId, $payFrom, $payTo, [
+            'refund_id' => $refundId, 'refunded_amount' => $refundedNow,
+        ], $this->actor);
+        $p['refunded_amount'] = $refundedNow;
+        $p['status'] = $payTo;
+        if ($payTo === 'refunded') {
+            // Экземпляр остаётся sold: возврат денег не возвращает книгу в продажу.
+            $this->exec(
+                'UPDATE %i SET refunded_at = COALESCE(refunded_at, UTC_TIMESTAMP(6)) WHERE payment_id = %d',
+                $t['sales'],
+                $paymentId
+            );
+        }
+
+        // Заказ: только возврат основного платежа (возврат дубля сумму заказа не меняет).
+        if ($this->primaryPaymentId((int) $order['id'], $payments) !== $paymentId) {
+            return;
+        }
+        $orderRefunded = (int) $order['refunded_amount'] + $amount;
+        $this->expectAffected($this->exec(
+            'UPDATE %i SET refunded_amount = refunded_amount + %d WHERE id = %d AND refunded_amount = %d',
+            $t['orders'],
+            $amount,
+            (int) $order['id'],
+            (int) $order['refunded_amount']
+        ), 1, 'order refunded_amount');
+        $order['refunded_amount'] = $orderRefunded;
+        $target = $orderRefunded >= (int) $order['total_amount'] ? 'refunded' : 'partially_refunded';
+        if ($order['status'] !== $target) {
+            $this->moveOrder($order, $target, ['refund_id' => $refundId, 'refunded_amount' => $orderRefunded]);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $refund
+     * @param array<string, mixed> $order
+     */
+    private function failRefundLocked(array $refund, array &$order, string $message, ?string $providerRefundId): void
+    {
+        $this->expectAffected($this->exec(
+            "UPDATE %i
+                SET provider_refund_id = COALESCE(provider_refund_id, NULLIF(%s, '')), completed_at = UTC_TIMESTAMP(6),
+                    failure_message = %s, status = 'failed'
+              WHERE id = %d AND status IN ('requested', 'pending')",
+            $this->db->table('book_refunds'),
+            $providerRefundId ?? '',
+            mb_substr($message, 0, 255),
+            (int) $refund['id']
+        ), 1, 'refund → failed');
+        $this->audit->record('refund.status_changed', 'refund', (int) $refund['id'], (string) $refund['status'], 'failed', [
+            'order_id' => (int) $order['id'], 'reason' => $message,
+        ], $this->actor);
+        $this->flagOrder($order, 'refund_failed', ['refund_id' => (int) $refund['id']]);
+    }
+
+    /**
+     * Чек «возврат прихода»: все книги заказа (дубль, полный возврат); иначе книги, не проданные по этому
+     * платежу (поздний платёж с конфликтом); иначе одна позиция на сумму возврата.
+     */
+    private function refundReceipt(int $orderId, int $paymentId, int $amount): ?FiscalReceipt
+    {
+        $t = $this->tables();
+        $order = $this->row(
+            'SELECT public_order_id, customer_email, customer_phone, pii_erased_at FROM %i WHERE id = %d',
+            $t['orders'],
+            $orderId
+        );
+        $lines = $this->rows(
+            'SELECT book_item_id, title_snapshot, unit_price_amount FROM %i WHERE order_id = %d ORDER BY id',
+            $t['order_items'],
+            $orderId
+        );
+        if ($order === null || $lines === []) {
+            return null;
+        }
+        $sold = array_map('intval', $this->col(
+            'SELECT book_item_id FROM %i WHERE order_id = %d AND payment_id = %d',
+            $t['sales'],
+            $orderId,
+            $paymentId
+        ));
+        $toLine = static fn (array $r): array => [
+            'title' => (string) $r['title_snapshot'], 'amount' => (int) $r['unit_price_amount'], 'book_item_id' => (int) $r['book_item_id'],
+        ];
+        $all = array_map($toLine, $lines);
+        $unsold = array_map($toLine, array_values(array_filter($lines, static fn (array $r): bool => !\in_array((int) $r['book_item_id'], $sold, true))));
+        $sum = static fn (array $ls): int => array_sum(array_column($ls, 'amount'));
+        $chosen = match (true) {
+            $sum($all) === $amount => $all,
+            $unsold !== [] && $sum($unsold) === $amount => $unsold,
+            default => [[
+                /* translators: %s: public order number */
+                'title' => \sprintf(\__('Refund for order %s', 'uniundata-books'), (string) $order['public_order_id']),
+                'amount' => $amount,
+                'book_item_id' => null,
+            ]],
+        };
+        // После обезличивания контактов чек отправить некуда: адаптер получит null и решит сам.
+        $email = $order['pii_erased_at'] === null ? (string) $order['customer_email'] : null;
+        $phone = $order['pii_erased_at'] === null ? $order['customer_phone'] : null;
+        try {
+            return FiscalReceipt::fromLines($chosen, $email, $phone, $orderId, $amount, 'refund');
+        } catch (\InvalidArgumentException | \LogicException $e) {
+            error_log(\sprintf('[uniundata] refund receipt for order #%d not built: %s', $orderId, $e::class));
+
+            return null;
+        }
+    }
+
+    /** Следующий опрос незавершённого возврата: 1 мин → 5 мин → 30 мин → 6 ч (по возрасту возврата). */
+    private function scheduleRefundFollowUp(int $refundId, int $ageSeconds): void
+    {
+        if (!\function_exists('as_schedule_single_action')) {
+            error_log('[uniundata] Action Scheduler is not loaded; refund follow-up skipped: #' . $refundId);
+
+            return;
+        }
+        $delay = match (true) {
+            $ageSeconds < 600 => 60,
+            $ageSeconds < 3600 => 300,
+            $ageSeconds < self::REFUND_STUCK_SECONDS => 1800,
+            default => 21600,
+        };
+        // Без unique: текущий (in-progress) запуск той же задачи иначе заблокировал бы постановку.
+        as_schedule_single_action(time() + $delay, self::HOOK_REFUND, ['refund_id' => $refundId], self::AS_GROUP);
     }
 
     // =================================================================================================
@@ -260,17 +678,19 @@ final class PaymentService
         $payment = $this->locatePayment($r);
         if ($payment === null) {
             // Валидное событие, но платёж не наш / неизвестен: не ошибка доставки, повтор не поможет.
-            if ($eventId !== null) {
-                $this->exec(
-                    "UPDATE %i SET processed_at = UTC_TIMESTAMP(6), error_message = 'payment_not_found', processing_status = 'ignored'
-                      WHERE id = %d AND processing_status IN ('received', 'failed')",
-                    $this->db->table('book_payment_events'),
-                    $eventId
-                );
-            }
-            $this->audit->record('payment.unmatched_result', 'payment_event', $eventId ?? 0, null, $r->status->value, [
-                'provider' => $r->provider, 'provider_payment_id' => $r->providerPaymentId,
-            ], $actor);
+            $this->db->transaction(function () use ($r, $eventId, $actor): void {
+                if ($eventId !== null) {
+                    $this->exec(
+                        "UPDATE %i SET processed_at = UTC_TIMESTAMP(6), error_message = 'payment_not_found', processing_status = 'ignored'
+                          WHERE id = %d AND processing_status IN ('received', 'failed')",
+                        $this->db->table('book_payment_events'),
+                        $eventId
+                    );
+                }
+                $this->audit->record('payment.unmatched_result', 'payment_event', $eventId, null, $r->status->value, [
+                    'provider' => $r->provider, 'provider_payment_id' => $r->providerPaymentId,
+                ], $actor);
+            });
 
             return ['ignored', 'payment_not_found'];
         }
@@ -285,10 +705,7 @@ final class PaymentService
 
         $res = $this->db->transaction(function () use ($r, $eventId, $actor, $paymentId, $orderId, $itemIds): array {
             // Db::transaction() может повторить замыкание после deadlock: состояние сбрасываем.
-            $this->afterCommit = [];
-            $this->sessionsToCancel = [];
-            $this->actor = $actor;
-            $this->currentEventId = $eventId;
+            $this->resetTxState($actor, $eventId);
 
             return $this->applyTx($r, $eventId, $paymentId, $orderId, $itemIds);
         });
@@ -314,15 +731,10 @@ final class PaymentService
             ...$itemIds
         );
         // (5) Заказ.
-        $order = $this->row(
-            'SELECT id, user_id, public_order_id, status, total_amount, currency, refunded_amount, needs_attention, attention_reason
-               FROM %i WHERE id = %d FOR UPDATE',
-            $t['orders'],
-            $orderId
-        );
-        // (6) Все платежи заказа: нужны для проверки дубля и «последней попытки».
+        $order = $this->lockOrder($orderId);
+        // (6) Все платежи заказа: нужны для проверки дубля, «последней попытки» и основного платежа.
         $payments = $this->rowsById(
-            'SELECT id, attempt_no, status, amount, currency, provider_payment_id, idempotency_key
+            'SELECT id, attempt_no, status, amount, refunded_amount, currency, provider_payment_id, idempotency_key
                FROM %i WHERE order_id = %d ORDER BY id FOR UPDATE',
             $t['payments'],
             $orderId
@@ -349,7 +761,7 @@ final class PaymentService
                 'succeeded' => $this->applySucceeded($r, $order, $payments, $paymentId, $items),
                 'pending', 'processing' => $this->applyInFlight($r, $order, $payments, $paymentId),
                 'failed', 'cancelled', 'expired' => $this->applyFailure($r, $order, $payments, $paymentId),
-                'refunded', 'partially_refunded' => $this->applyRefund($r, $order, $payments, $paymentId),
+                'refunded', 'partially_refunded' => $this->applyRefundEvent($r, $order, $payments, $paymentId),
                 default => ['ignored', 'unsupported_status'],
             };
         }
@@ -389,11 +801,11 @@ final class PaymentService
         // Сверка суммы и валюты с нашим платежом (= сумма заказа на момент попытки).
         if ($r->amount === null || $r->currency === null || $r->amount !== (int) $p['amount'] || $r->currency !== $p['currency']) {
             $this->exec('UPDATE %i SET provider_status = %s WHERE id = %d', $t['payments'], $r->providerStatus, $paymentId);
-            $this->flagOrder($order, 'amount_mismatch');
+            $this->flagOrder($order, 'amount_mismatch', ['payment_id' => $paymentId]);
 
             return ['processed', 'amount_mismatch'];
         }
-        if (in_array($p['status'], self::MONEY_RECEIVED, true)) {
+        if (\in_array($p['status'], self::MONEY_RECEIVED, true)) {
             return ['ignored', 'already_succeeded']; // повтор успеха: статусы уже такие
         }
 
@@ -402,19 +814,19 @@ final class PaymentService
         // Второй успешный платёж по уже оплаченному заказу: деньги вернуть, заказ не трогать.
         $otherSucceeded = false;
         foreach ($payments as $id => $q) {
-            if ($id !== $paymentId && in_array($q['status'], self::MONEY_RECEIVED, true)) {
+            if ($id !== $paymentId && \in_array($q['status'], self::MONEY_RECEIVED, true)) {
                 $otherSucceeded = true;
             }
         }
-        if ($otherSucceeded || in_array($order['status'], self::PAID_ORDER_STATUSES, true)) {
-            $this->flagOrder($order, 'duplicate_payment');
-            $this->afterCommit[] = [self::HOOK_REFUND, ['payment_id' => $paymentId, 'amount' => (int) $p['amount'], 'reason' => 'duplicate_payment']];
+        if ($otherSucceeded || \in_array($order['status'], self::PAID_ORDER_STATUSES, true)) {
+            $this->flagOrder($order, 'duplicate_payment', ['payment_id' => $paymentId]);
+            $this->createRefundLocked($order, $p, (int) $p['amount'], 'duplicate_payment', null);
 
             return ['processed', 'duplicate_payment'];
         }
 
         // Поздний платёж: заказ уже payment_expired/cancelled, экземпляры освобождены.
-        $late = in_array($order['status'], ['payment_expired', 'cancelled'], true);
+        $late = \in_array($order['status'], ['payment_expired', 'cancelled'], true);
         $activeReserved = [];
         if ($late && $items !== []) {
             // Обычное чтение: экземпляры заблокированы нами, новый резерв на них сейчас невозможен.
@@ -427,14 +839,18 @@ final class PaymentService
         }
         $sellable = [];
         $conflict = [];
+        $sourceCheck = [];
         foreach ($items as $id => $it) {
             $ok = $late
-                ? in_array($it['availability_status'], self::FREE_ITEM_STATUSES, true) && !in_array($id, $activeReserved, true)
+                ? \in_array($it['availability_status'], self::FREE_ITEM_STATUSES, true) && !\in_array($id, $activeReserved, true)
                 : $it['availability_status'] === 'checkout_pending';
-            if ($ok) {
-                $sellable[] = (int) $id;
-            } else {
+            if (!$ok) {
                 $conflict[] = (int) $id;
+                continue;
+            }
+            $sellable[] = (int) $id;
+            if ($late && $it['source_status'] !== 'present') {
+                $sourceCheck[] = (int) $id; // источник говорит «нет/снят»: книгу нужно проверить физически
             }
         }
 
@@ -443,11 +859,11 @@ final class PaymentService
             $this->expectAffected($this->exec(
                 "UPDATE %i
                     SET sold_at = UTC_TIMESTAMP(6), status_changed_at = UTC_TIMESTAMP(6), availability_status = 'sold'
-                  WHERE id IN (" . $this->in($sellable) . ') AND availability_status IN (' . implode(',', array_fill(0, count($from), '%s')) . ')',
+                  WHERE id IN (" . $this->in($sellable) . ') AND availability_status IN (' . implode(',', array_fill(0, \count($from), '%s')) . ')',
                 $t['items'],
                 ...$sellable,
                 ...$from
-            ), count($sellable), 'items → sold');
+            ), \count($sellable), 'items → sold');
             // UNIQUE(book_item_id) и UNIQUE(order_item_id) — второй рубеж от двойной продажи.
             $this->expectAffected($this->exec(
                 'INSERT INTO %i
@@ -463,7 +879,7 @@ final class PaymentService
                 $t['orders'],
                 $orderId,
                 ...$sellable
-            ), count($sellable), 'sales insert');
+            ), \count($sellable), 'sales insert');
             foreach ($sellable as $id) {
                 $this->audit->record('item.status_changed', 'item', $id, (string) $items[$id]['availability_status'], 'sold', [
                     'order_id' => $orderId, 'payment_id' => $paymentId, 'late_payment' => $late,
@@ -472,7 +888,7 @@ final class PaymentService
         }
 
         $this->moveOrder($order, 'paid', ['payment_id' => $paymentId, 'late_payment' => $late]);
-        $this->closeOtherPendingAttempts($payments, $paymentId);
+        $this->closeOtherOpenAttempts($payments, $paymentId);
 
         if ($conflict !== []) {
             // Часть экземпляров ушла другим: продаём свободные, остальное — возврат. Деньги не теряются.
@@ -484,8 +900,12 @@ final class PaymentService
                     $orderId,
                     ...$conflict
                 );
-            $this->flagOrder($order, 'late_payment_conflict', ['conflict_item_ids' => $conflict, 'refund_amount' => $refund]);
-            $this->afterCommit[] = [self::HOOK_REFUND, ['payment_id' => $paymentId, 'amount' => $refund, 'reason' => 'late_payment_conflict']];
+            $this->flagOrder($order, 'late_payment_conflict', [
+                'conflict_item_ids' => $conflict, 'refund_amount' => $refund, 'source_check_item_ids' => $sourceCheck,
+            ]);
+            $this->createRefundLocked($order, $p, $refund, 'late_payment_conflict', null);
+        } elseif ($sourceCheck !== []) {
+            $this->flagOrder($order, 'late_payment_source_check', ['source_check_item_ids' => $sourceCheck]);
         }
         if ($sellable !== []) {
             $this->afterCommit[] = [self::HOOK_ORDER_PAID, ['order_id' => $orderId]];
@@ -508,10 +928,10 @@ final class PaymentService
             return ['ignored', 'stale_or_repeated_status'];
         }
         if ($this->isLatestAttempt($payments, $paymentId)) {
-            if ($to === 'pending' && in_array($order['status'], ['draft', 'payment_failed'], true)) {
+            if ($to === 'pending' && \in_array($order['status'], ['draft', 'payment_failed'], true)) {
                 $this->moveOrder($order, 'pending_payment', ['payment_id' => $paymentId]);
             }
-            if ($to === 'processing' && in_array($order['status'], ['draft', 'pending_payment', 'payment_failed'], true)) {
+            if ($to === 'processing' && \in_array($order['status'], ['draft', 'pending_payment', 'payment_failed'], true)) {
                 $this->moveOrder($order, 'payment_processing', ['payment_id' => $paymentId]);
             }
         }
@@ -533,7 +953,7 @@ final class PaymentService
             return ['ignored', 'stale_or_repeated_status']; // например, cancelled после нашей отмены заказа
         }
         if ($this->isLatestAttempt($payments, $paymentId)
-            && in_array($order['status'], ['draft', 'pending_payment', 'payment_processing'], true)) {
+            && \in_array($order['status'], ['draft', 'pending_payment', 'payment_processing'], true)) {
             $this->moveOrder($order, 'payment_failed', ['payment_id' => $paymentId, 'failure_code' => $r->failureCode]);
         }
 
@@ -541,43 +961,63 @@ final class PaymentService
     }
 
     /**
-     * Подтверждение возврата. Статус заказа меняется только возвратом «основного» платежа (того, что
-     * оплатил заказ); возврат дублирующего платежа меняет только сам платёж.
+     * Событие возврата от банка (refunded / partially_refunded; refundedAmount — накопленная сумма).
+     * Сопоставление со строкой wp_book_refunds: по provider_refund_id / ключу возврата; иначе по приросту
+     * суммы — открытый возврат на ту же сумму; иначе возврат сделан мимо плагина (личный кабинет банка) и
+     * записывается в журнал как reason='manual'. Итоговые суммы — completeRefundLocked().
      *
      * @param array<string, mixed>             $order
      * @param array<int, array<string, mixed>> $payments
      * @return array{0: string, 1: string}
      */
-    private function applyRefund(ProviderPaymentResult $r, array &$order, array &$payments, int $paymentId): array
+    private function applyRefundEvent(ProviderPaymentResult $r, array &$order, array &$payments, int $paymentId): array
     {
         $t = $this->tables();
-        $to = $r->status->value;
-        $moved = $this->movePayment($payments[$paymentId], $to, $r);
-        $grows = $payments[$paymentId]['status'] === 'partially_refunded' && $to === 'partially_refunded';
-        if (!$moved && !$grows) {
-            return ['ignored', 'stale_or_repeated_status'];
-        }
-        if ($r->refundedAmount === null || $this->primaryPaymentId((int) $order['id'], $payments) !== $paymentId) {
-            return ['processed', 'non_primary_refund'];
-        }
+        $p = $payments[$paymentId];
+        if (!\in_array($p['status'], self::MONEY_RECEIVED, true)) {
+            $this->flagOrder($order, 'refund_unexpected', ['payment_id' => $paymentId]);
 
-        $refunded = min((int) $order['total_amount'], $r->refundedAmount);
-        $this->exec(
-            'UPDATE %i SET refunded_amount = GREATEST(refunded_amount, %d) WHERE id = %d',
-            $t['orders'],
-            $refunded,
-            (int) $order['id']
-        );
-        $target = $refunded >= (int) $order['total_amount'] ? 'refunded' : 'partially_refunded';
-        $this->moveOrder($order, $target, ['payment_id' => $paymentId, 'refunded_amount' => $refunded]);
-        if ($target === 'refunded') {
-            // Экземпляр остаётся sold: возврат денег не возвращает книгу в продажу.
-            $this->exec(
-                'UPDATE %i SET refunded_at = COALESCE(refunded_at, UTC_TIMESTAMP(6)) WHERE payment_id = %d',
-                $t['sales'],
-                $paymentId
-            );
+            return ['processed', 'refund_for_unpaid_payment'];
         }
+        // (8) Возвраты платежа.
+        $refunds = $this->rowsById(
+            'SELECT id, status, amount, idempotency_key, provider_refund_id FROM %i WHERE payment_id = %d ORDER BY id FOR UPDATE',
+            $t['refunds'],
+            $paymentId
+        );
+        $match = null;
+        foreach ($refunds as $rf) {
+            if (($r->providerRefundId !== null && $rf['provider_refund_id'] === $r->providerRefundId)
+                || ($r->refundIdempotencyKey !== null && $rf['idempotency_key'] === $r->refundIdempotencyKey)) {
+                $match = $rf;
+                break;
+            }
+        }
+        if ($match === null) {
+            $delta = $r->refundedAmount === null ? 0 : $r->refundedAmount - (int) $p['refunded_amount'];
+            if ($delta <= 0) {
+                return ['ignored', 'stale_or_repeated_refund'];
+            }
+            foreach ($refunds as $rf) {
+                if (\in_array($rf['status'], ['requested', 'pending'], true) && (int) $rf['amount'] === $delta) {
+                    $match = $rf;
+                    break;
+                }
+            }
+            if ($match === null) {
+                if ($delta > (int) $p['amount'] - (int) $p['refunded_amount']) {
+                    $this->flagOrder($order, 'refund_mismatch', ['payment_id' => $paymentId, 'bank_refunded_amount' => $r->refundedAmount]);
+
+                    return ['processed', 'refund_mismatch'];
+                }
+                $refundId = $this->createRefundLocked($order, $p, $delta, 'manual', null, false);
+                $match = ['id' => $refundId, 'status' => 'requested', 'amount' => $delta];
+            }
+        }
+        if (!\in_array($match['status'], ['requested', 'pending'], true)) {
+            return ['ignored', 'refund_already_final'];
+        }
+        $this->completeRefundLocked($match, $order, $payments, $paymentId, $r->providerRefundId);
 
         return ['processed', ''];
     }
@@ -593,18 +1033,18 @@ final class PaymentService
         if ($from === $to) {
             return false;
         }
-        // created → (succeeded|processing|cancelled|expired): контракт не знает прямого перехода — через pending
-        // (webhook пришёл раньше, чем Tx2 checkout записал pending).
-        if ($from === 'created' && !in_array($to, ['pending', 'failed'], true)) {
+        // created → succeeded|processing|failed: прямого перехода нет — через pending (событие банка по сессии
+        // пришло раньше, чем Tx2 checkout записал pending). created → cancelled|expired — напрямую (контракт v2).
+        if ($from === 'created' && \in_array($to, ['succeeded', 'processing', 'failed'], true)) {
             if (!$this->movePayment($p, 'pending', $r)) {
                 return false;
             }
             $from = 'pending';
         }
-        if (!in_array($from, self::PAYMENT_FROM[$to] ?? [], true)) {
+        if (!\in_array($from, self::PAYMENT_FROM[$to] ?? [], true)) {
             return false;
         }
-        $isFailure = in_array($to, ['failed', 'cancelled', 'expired'], true) ? 1 : 0;
+        $isFailure = \in_array($to, ['failed', 'cancelled', 'expired'], true) ? 1 : 0;
         $this->expectAffected($this->exec(
             "UPDATE %i
                 SET provider_payment_id = COALESCE(provider_payment_id, NULLIF(%s, '')),
@@ -633,7 +1073,7 @@ final class PaymentService
         $this->audit->record('payment.status_changed', 'payment', (int) $p['id'], $from, $to, [
             'provider_status' => $r->providerStatus,
             'event_id' => $this->currentEventId,
-            'late_confirmation' => in_array($from, ['failed', 'expired', 'cancelled'], true),
+            'late_confirmation' => \in_array($from, ['failed', 'expired', 'cancelled'], true),
         ], $this->actor);
         $p['status'] = $to;
 
@@ -651,12 +1091,12 @@ final class PaymentService
             return false;
         }
         // draft → paid/processing и payment_failed → processing — через pending_payment (две записи аудита).
-        if (($from === 'draft' && in_array($to, ['paid', 'payment_processing'], true))
+        if (($from === 'draft' && \in_array($to, ['paid', 'payment_processing'], true))
             || ($from === 'payment_failed' && $to === 'payment_processing')) {
             $this->moveOrder($order, 'pending_payment', $context);
             $from = 'pending_payment';
         }
-        if (!in_array($from, self::ORDER_FROM[$to] ?? [], true)) {
+        if (!\in_array($from, self::ORDER_FROM[$to] ?? [], true)) {
             return false;
         }
         $this->expectAffected($this->exec(
@@ -677,46 +1117,55 @@ final class PaymentService
     }
 
     /**
+     * needs_attention + причина + уведомление менеджеру после COMMIT. Блокирующую причину (amount/reference
+     * mismatch держит заказ от автозакрытия) менее важная не перетирает; история причин — в аудите.
+     *
      * @param array<string, mixed> $order
      * @param array<string, mixed> $context
      */
     private function flagOrder(array &$order, string $reason, array $context = []): void
     {
-        $changed = $this->exec(
-            'UPDATE %i SET attention_reason = %s, needs_attention = 1 WHERE id = %d',
-            $this->db->table('book_orders'),
-            $reason,
-            (int) $order['id']
-        );
-        if ($changed === 0) {
+        $current = $order['attention_reason'] ?? null;
+        $flagged = (int) $order['needs_attention'] === 1;
+        if ($flagged && $current === $reason) {
             return; // уже на разборе по той же причине: без повторного аудита и уведомления
         }
+        $stored = $flagged && \in_array($current, self::BLOCKING_ATTENTION, true) && !\in_array($reason, self::BLOCKING_ATTENTION, true)
+            ? (string) $current
+            : $reason;
+        $this->exec(
+            'UPDATE %i SET attention_reason = %s, needs_attention = 1 WHERE id = %d',
+            $this->db->table('book_orders'),
+            $stored,
+            (int) $order['id']
+        );
         $order['needs_attention'] = 1;
-        $order['attention_reason'] = $reason;
+        $order['attention_reason'] = $stored;
         $this->audit->record('order.needs_attention', 'order', (int) $order['id'], null, null, $context + [
-            'reason' => $reason, 'event_id' => $this->currentEventId,
+            'reason' => $reason, 'previous_reason' => $current, 'event_id' => $this->currentEventId,
         ], $this->actor);
         $this->afterCommit[] = [self::HOOK_ATTENTION, ['order_id' => (int) $order['id'], 'reason' => $reason]];
     }
 
     /**
-     * Заказ оплачен: другие живые попытки (pending) закрываем у себя и после COMMIT — у банка,
+     * Заказ оплачен: другие открытые попытки (created/pending) закрываем у себя и после COMMIT — у банка,
      * чтобы покупатель не оплатил второй раз из соседней вкладки. Если всё же оплатит — duplicate_payment.
      *
      * @param array<int, array<string, mixed>> $payments
      */
-    private function closeOtherPendingAttempts(array &$payments, int $paidPaymentId): void
+    private function closeOtherOpenAttempts(array &$payments, int $paidPaymentId): void
     {
         foreach ($payments as $id => $q) {
-            if ($id === $paidPaymentId || $q['status'] !== 'pending') {
+            if ($id === $paidPaymentId || !\in_array($q['status'], ['created', 'pending'], true)) {
                 continue;
             }
             $this->expectAffected($this->exec(
-                "UPDATE %i SET status = 'cancelled' WHERE id = %d AND status = 'pending'",
+                "UPDATE %i SET status = 'cancelled' WHERE id = %d AND status = %s",
                 $this->db->table('book_payments'),
-                (int) $id
-            ), 1, 'other attempt pending → cancelled');
-            $this->audit->record('payment.status_changed', 'payment', (int) $id, 'pending', 'cancelled', [
+                (int) $id,
+                (string) $q['status']
+            ), 1, 'other attempt → cancelled');
+            $this->audit->record('payment.status_changed', 'payment', (int) $id, (string) $q['status'], 'cancelled', [
                 'reason' => 'order_paid_by_other_attempt', 'paid_payment_id' => $paidPaymentId,
             ], $this->actor);
             $payments[$id]['status'] = 'cancelled';
@@ -751,12 +1200,32 @@ final class PaymentService
             return (int) $fromSales;
         }
         foreach ($payments as $id => $p) { // ORDER BY id
-            if (in_array($p['status'], self::MONEY_RECEIVED, true)) {
+            if (\in_array($p['status'], self::MONEY_RECEIVED, true)) {
                 return (int) $id;
             }
         }
 
         return null;
+    }
+
+    /** @return ?array<string, mixed> (5) Заказ FOR UPDATE. */
+    private function lockOrder(int $orderId): ?array
+    {
+        return $this->row(
+            'SELECT id, user_id, public_order_id, status, total_amount, currency, refunded_amount, needs_attention, attention_reason
+               FROM %i WHERE id = %d FOR UPDATE',
+            $this->db->table('book_orders'),
+            $orderId
+        );
+    }
+
+    /** Db::transaction() может повторить замыкание после deadlock: состояние транзакции — с нуля. */
+    private function resetTxState(string $actor, ?int $eventId): void
+    {
+        $this->afterCommit = [];
+        $this->sessionsToCancel = [];
+        $this->actor = $actor;
+        $this->currentEventId = $eventId;
     }
 
     // =================================================================================================
@@ -767,36 +1236,39 @@ final class PaymentService
     private function storeEvent(ProviderPaymentResult $event, string $rawBody): int
     {
         $payload = wp_json_encode(self::redact($event->redactedPayload));
-        // LAST_INSERT_ID(id) в ветке дубля: $wpdb->insert_id вернёт id существующей строки.
-        $this->exec(
-            "INSERT INTO %i
-               (provider, provider_event_id, event_type, processing_status, payload_redacted, payload_sha256, received_at, attempts)
-             VALUES (%s, %s, %s, 'received', %s, %s, UTC_TIMESTAMP(6), 1)
-             ON DUPLICATE KEY UPDATE attempts = LEAST(attempts + 1, 65535), id = LAST_INSERT_ID(id)",
-            $this->db->table('book_payment_events'),
-            $event->provider,
-            $event->eventId ?? hash('sha256', $rawBody),
-            $event->eventType ?? $event->status->value,
-            is_string($payload) ? $payload : '{}',
-            hash('sha256', $rawBody)
-        );
-        $id = (int) $this->wpdb->insert_id;
-        if ($id <= 0) {
-            throw new \RuntimeException('payment event insert returned no id');
-        }
 
-        return $id;
+        return $this->db->transaction(function () use ($event, $rawBody, $payload): int {
+            // LAST_INSERT_ID(id) в ветке дубля: Db::lastInsertId() вернёт id существующей строки.
+            $this->exec(
+                "INSERT INTO %i
+                   (provider, provider_event_id, event_type, processing_status, payload_redacted, payload_sha256, received_at, attempts)
+                 VALUES (%s, %s, %s, 'received', %s, %s, UTC_TIMESTAMP(6), 1)
+                 ON DUPLICATE KEY UPDATE attempts = LEAST(attempts + 1, 65535), id = LAST_INSERT_ID(id)",
+                $this->db->table('book_payment_events'),
+                $event->provider,
+                $event->eventId ?? hash('sha256', $rawBody),
+                $event->eventType ?? $event->status->value,
+                \is_string($payload) ? $payload : '{}',
+                hash('sha256', $rawBody)
+            );
+            $id = $this->db->lastInsertId();
+            if ($id <= 0) {
+                throw new \RuntimeException('payment event insert returned no id');
+            }
+
+            return $id;
+        });
     }
 
     private function markEventFailed(int $eventId, string $error): void
     {
-        $this->exec(
+        $this->db->transaction(fn (): int => $this->exec(
             "UPDATE %i SET error_message = %s, processing_status = 'failed'
               WHERE id = %d AND processing_status IN ('received', 'failed')",
             $this->db->table('book_payment_events'),
             mb_substr($error, 0, 500),
             $eventId
-        );
+        ));
     }
 
     /** @return ?array<string, mixed> */
@@ -832,12 +1304,12 @@ final class PaymentService
         $actions = $this->afterCommit;
         $this->afterCommit = [];
         foreach ($actions as [$hook, $args]) {
-            if (!function_exists('as_enqueue_async_action')) {
+            if (!\function_exists('as_enqueue_async_action')) {
                 error_log('[uniundata] Action Scheduler is not loaded; action skipped: ' . $hook);
                 continue;
             }
-            // unique = true: одинаковая задача с теми же аргументами не ставится дважды.
-            // Обработчики идемпотентны (проверяют аудит / статус возврата), т.к. AS даёт at-least-once.
+            // unique = true экономит дубли, но не гарантирует их отсутствия: обработчики идемпотентны
+            // (письмо — по аудиту, возврат — по статусу строки wp_book_refunds).
             as_enqueue_async_action($hook, $args, self::AS_GROUP, true);
         }
     }
@@ -850,19 +1322,31 @@ final class PaymentService
             try {
                 $this->provider->cancelSession((string) $q['provider_payment_id'], (string) $q['idempotency_key']);
             } catch (\Throwable $e) {
-                error_log(sprintf('[uniundata] cancelSession failed for payment #%d: %s', (int) $q['id'], $e::class));
+                error_log(\sprintf('[uniundata] cancelSession failed for payment #%d: %s', (int) $q['id'], $e::class));
             }
         }
     }
 
-    /** Невалидная подпись: в аудит не чаще раза в минуту (защита от заливки таблицы), тело не пишем. */
+    /**
+     * Невалидная подпись: в аудит не чаще раза в минуту (защита от заливки таблицы), тело не пишем.
+     * Троттлинг — по самому журналу (ix_audit_action), без зависимости от постоянного объектного кэша.
+     */
     private function noteRejectedWebhook(string $reason): void
     {
         error_log('[uniundata] webhook rejected: ' . $reason);
-        if (function_exists('wp_cache_add') && !wp_cache_add('webhook_rejected_' . intdiv(time(), 60), 1, 'uniundata', 120)) {
-            return;
+        try {
+            $this->db->transaction(function () use ($reason): void {
+                $recent = $this->scalar(
+                    "SELECT 1 FROM %i WHERE action = 'payment.webhook_rejected' AND occurred_at > UTC_TIMESTAMP(6) - INTERVAL 60 SECOND LIMIT 1",
+                    $this->db->table('book_audit_log')
+                );
+                if ($recent === null) {
+                    $this->audit->record('payment.webhook_rejected', 'payment_event', null, null, null, ['reason' => $reason], 'webhook');
+                }
+            });
+        } catch (\Throwable $e) {
+            error_log('[uniundata] webhook rejection audit failed: ' . $e::class);
         }
-        $this->audit->record('payment.webhook_rejected', 'payment_event', 0, null, null, ['reason' => $reason], 'webhook');
     }
 
     // =================================================================================================
@@ -879,70 +1363,55 @@ final class PaymentService
             'order_items' => $this->db->table('book_order_items'),
             'payments' => $this->db->table('book_payments'),
             'events' => $this->db->table('book_payment_events'),
+            'refunds' => $this->db->table('book_refunds'),
             'sales' => $this->db->table('book_sales'),
         ];
     }
 
     /** @return ?array<string, mixed> */
-    private function row(string $sql, mixed ...$args): ?array
+    private function row(string $sql, int|string|float ...$args): ?array
     {
-        $r = $this->wpdb->get_row($this->wpdb->prepare($sql, ...$args), ARRAY_A);
-        $this->assertNoDbError();
+        return $this->db->getRow($sql, ...$args);
+    }
 
-        return is_array($r) ? $r : null;
+    /** @return list<array<string, mixed>> */
+    private function rows(string $sql, int|string|float ...$args): array
+    {
+        return $this->db->getResults($sql, ...$args);
     }
 
     /** @return array<int, array<string, mixed>> */
-    private function rowsById(string $sql, mixed ...$args): array
+    private function rowsById(string $sql, int|string|float ...$args): array
     {
-        $r = $this->wpdb->get_results($this->wpdb->prepare($sql, ...$args), ARRAY_A);
-        $this->assertNoDbError();
         $out = [];
-        foreach (is_array($r) ? $r : [] as $row) {
-            $out[(int) $row['id']] = $row;
+        foreach ($this->db->getResults($sql, ...$args) as $r) {
+            $out[(int) $r['id']] = $r;
         }
 
         return $out;
     }
 
-    /** @return list<string> */
-    private function col(string $sql, mixed ...$args): array
+    /** @return list<string> Первая колонка результата. */
+    private function col(string $sql, int|string|float ...$args): array
     {
-        $r = $this->wpdb->get_col($this->wpdb->prepare($sql, ...$args));
-        $this->assertNoDbError();
-
-        return array_values(array_map('strval', $r));
+        return array_map(static fn (array $r): string => (string) array_values($r)[0], $this->db->getResults($sql, ...$args));
     }
 
-    private function scalar(string $sql, mixed ...$args): ?string
+    private function scalar(string $sql, int|string|float ...$args): ?string
     {
-        $r = $this->wpdb->get_var($this->wpdb->prepare($sql, ...$args));
-        $this->assertNoDbError();
-
-        return $r === null ? null : (string) $r;
+        return $this->db->getVar($sql, ...$args);
     }
 
-    private function exec(string $sql, mixed ...$args): int
+    /** INSERT/UPDATE: число изменённых строк (UPDATE теми же значениями даёт 0). Ошибка MySQL → исключение. */
+    private function exec(string $sql, int|string|float ...$args): int
     {
-        $r = $this->wpdb->query($this->wpdb->prepare($sql, ...$args));
-        if ($r === false) {
-            throw new \RuntimeException('DB error: ' . $this->wpdb->last_error, $this->db->lastErrno());
-        }
-
-        return (int) $r;
-    }
-
-    private function assertNoDbError(): void
-    {
-        if ($this->wpdb->last_error !== '') {
-            throw new \RuntimeException('DB error: ' . $this->wpdb->last_error, $this->db->lastErrno());
-        }
+        return $this->db->execute($sql, ...$args);
     }
 
     private function expectAffected(int $actual, int $expected, string $what): void
     {
         if ($actual !== $expected) {
-            throw new \RuntimeException(sprintf('Unexpected affected rows for %s: %d instead of %d', $what, $actual, $expected));
+            throw new \RuntimeException(\sprintf('Unexpected affected rows for %s: %d instead of %d', $what, $actual, $expected));
         }
     }
 
@@ -958,6 +1427,6 @@ final class PaymentService
     /** @param list<int> $ids */
     private function in(array $ids): string
     {
-        return implode(',', array_fill(0, count($ids), '%d'));
+        return implode(',', array_fill(0, \count($ids), '%d'));
     }
 }

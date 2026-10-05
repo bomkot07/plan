@@ -8,15 +8,20 @@ use Uniundata\Books\Domain\ReservationStatus;
 use Uniundata\Books\Infrastructure\Db;
 
 /**
- * Pass A: снятие истёкших активных резервов (Action Scheduler `uniundata_expire_reservations`, раз в минуту).
+ * Pass A: снятие истёкших активных резервов (Action Scheduler `uniundata_expire_reservations`, раз в минуту)
+ * и закрытие заброшенных пустых корзин (`uniundata_abandon_carts`, раз в сутки).
  * Неоплаченные заказы (checkout_pending → payment_expired) снимает pass B — OrderExpiryService.
  *
  * Каждый резерв — своя короткая транзакция: блокировки держатся миллисекунды, а сбой одной строки
- * не откатывает и не останавливает остальные. Обработка идемпотентна: параллельный запуск или повтор
- * после сбоя видит, что резерв уже не active, и пропускает его.
+ * не откатывает и не останавливает остальные. Обработка идемпотентна: повтор после сбоя видит, что
+ * резерв уже не active, и пропускает его. GET_LOCK (Db::lockName(), имя уникально для БД и префикса)
+ * лишь не даёт двум раннерам (AS + WP-CLI) делать одну работу; корректность держат блокировки строк.
  */
 final class ReservationExpiryService
 {
+    public const LOCK_EXPIRE = 'expire_reservations';
+    public const LOCK_ABANDON = 'abandon_carts';
+
     public function __construct(
         private readonly Db $db,
         private readonly ReservationService $reservations,
@@ -33,6 +38,18 @@ final class ReservationExpiryService
     public function expireDue(int $limit = 200): int
     {
         $limit = max(1, min($limit, 1000));
+        if (!$this->db->getLock(self::LOCK_EXPIRE)) {
+            return 0; // другой раннер уже работает; оставшееся заберёт следующий запуск
+        }
+        try {
+            return $this->expireBatch($limit);
+        } finally {
+            $this->db->releaseLock(self::LOCK_EXPIRE);
+        }
+    }
+
+    private function expireBatch(int $limit): int
+    {
         $deadline = microtime(true) + $this->timeBudgetSeconds;
 
         // Кандидаты — обычным чтением без блокировок (ix_reservations_expiry: reservation_status, expires_at).
@@ -58,7 +75,8 @@ final class ReservationExpiryService
                 }
             } catch (\Throwable $e) {
                 // Включая uniundata_conflict_retry после исчерпания повторов: строка останется active
-                // и будет обработана следующим запуском. В лог — только ID и класс ошибки, без PII.
+                // и будет обработана следующим запуском. В лог — ID, класс и текст ошибки (персональных
+                // данных в этих запросах нет).
                 error_log(\sprintf(
                     '[uniundata] expire reservation #%d failed: %s: %s',
                     $reservationId,
@@ -73,7 +91,8 @@ final class ReservationExpiryService
 
     /**
      * Пустые открытые корзины без активности $days дней → abandoned (контракт: «пустая и без активности
-     * 30 дней»). Не входит в контракт pass A; можно вешать на ту же или ежедневную задачу планировщика.
+     * 30 дней»). Задача Action Scheduler `uniundata_abandon_carts`, раз в сутки. Корзина с активными
+     * позициями не закрывается (у неё пересчитывается только expires_at).
      *
      * @return int Сколько корзин закрыто.
      */
@@ -81,6 +100,18 @@ final class ReservationExpiryService
     {
         $days = max(1, $days);
         $limit = max(1, min($limit, 5000));
+        if (!$this->db->getLock(self::LOCK_ABANDON)) {
+            return 0;
+        }
+        try {
+            return $this->abandonBatch($days, $limit);
+        } finally {
+            $this->db->releaseLock(self::LOCK_ABANDON);
+        }
+    }
+
+    private function abandonBatch(int $days, int $limit): int
+    {
         $deadline = microtime(true) + $this->timeBudgetSeconds;
 
         // ix_carts_status_activity (status, last_activity_at).

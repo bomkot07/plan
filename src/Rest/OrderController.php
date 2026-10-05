@@ -15,7 +15,9 @@ use Uniundata\Books\Service\CheckoutService;
  *   GET  /orders                      — свои заказы (view_own_book_orders), постранично;
  *   GET  /orders/{public_order_id}    — заказ: владелец или менеджер (мета-capability view_book_order);
  *   POST /orders/{public_order_id}/pay    — новая/восстановленная платёжная попытка (строго владелец);
- *   POST /orders/{public_order_id}/cancel — отмена до оплаты (строго владелец).
+ *                                           409 uniundata_order_not_payable (data.order_status);
+ *   POST /orders/{public_order_id}/cancel — отмена до оплаты (строго владелец);
+ *                                           409 uniundata_order_not_cancellable (data.order_status).
  *
  * Несуществующий, чужой и синтаксически неверный public_order_id неразличимы: всегда 404.
  * Наружу выходит только public_order_id (uniundata_<UUID v4>), внутренний последовательный id — нет.
@@ -23,7 +25,7 @@ use Uniundata\Books\Service\CheckoutService;
  */
 final class OrderController extends RestController
 {
-    /** Строгий формат из ck_orders_public_id. Неподходящий путь → 404 rest_no_route (тоже 404). */
+    /** Строгий формат из CHECK wp_book_orders_chk_public_id. Неподходящий путь → 404 rest_no_route (тоже 404). */
     public const PUBLIC_ID_REGEX = 'uniundata_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 
     private const ORDER_STATUSES = [
@@ -161,7 +163,7 @@ final class OrderController extends RestController
                         customer_email, customer_phone, customer_first_name, customer_last_name, customer_middle_name,
                         billing_address_json, shipping_address_json, shipping_method,
                         placed_at, payment_due_at, paid_at, cancelled_at, cancel_reason, fulfilled_at, completed_at,
-                        needs_attention, attention_reason, created_at,
+                        payment_due_extended_at, pii_erased_at, needs_attention, attention_reason, created_at,
                         TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(6), payment_due_at) AS seconds_to_due,
                         UTC_TIMESTAMP(6) AS server_now
                    FROM {$this->db->table('book_orders')}
@@ -192,7 +194,7 @@ final class OrderController extends RestController
         return $this->respond($request, function () use ($request): array {
             $this->enforceRateLimit('cancel');
 
-            // {order, changed}; повторная отмена — 200 с changed=false.
+            // {order, changed}; повторная отмена — 200 с changed=false; деньги в пути / оплачен — 409 order_not_cancellable.
             return $this->checkout->cancel($this->currentUserId(), (string) $request->get_param('public_order_id'));
         });
     }
@@ -217,7 +219,7 @@ final class OrderController extends RestController
             $orderId,
         );
         $payments = $this->db->getResults(
-            "SELECT attempt_no, provider, status, provider_status, amount, currency, card_brand, card_last4,
+            "SELECT attempt_no, provider, status, provider_status, amount, refunded_amount, currency, card_brand, card_last4,
                     failure_code, session_expires_at, succeeded_at, created_at
                FROM {$this->db->table('book_payments')}
               WHERE order_id = %d
@@ -226,6 +228,7 @@ final class OrderController extends RestController
         );
 
         $status = (string) $o['status'];
+        $piiErased = $o['pii_erased_at'] !== null;
         $moneyInFlight = false;
         foreach ($payments as $p) {
             $moneyInFlight = $moneyInFlight || \in_array($p['status'], ['processing', 'succeeded', 'refunded', 'partially_refunded'], true);
@@ -259,16 +262,18 @@ final class OrderController extends RestController
                     && (int) $o['seconds_to_due'] - $graceSeconds >= self::MIN_SESSION_SECONDS,
                 'can_cancel' => $payableNow,
             ],
-            // Снимок данных покупателя: показывается владельцу (это его данные) и менеджеру.
-            'customer' => [
+            // Снимок данных покупателя: показывается владельцу (это его данные) и менеджеру. После обезличивания
+            // по сроку хранения (pii_erased_at) в колонках заглушки — наружу не отдаём.
+            'pii_erased' => $piiErased,
+            'customer' => $piiErased ? null : [
                 'email' => (string) $o['customer_email'],
                 'phone' => $o['customer_phone'],
                 'first_name' => (string) $o['customer_first_name'],
                 'last_name' => (string) $o['customer_last_name'],
                 'middle_name' => $o['customer_middle_name'],
             ],
-            'shipping_address' => self::decodeJson($o['shipping_address_json']),
-            'billing_address' => self::decodeJson($o['billing_address_json']),
+            'shipping_address' => $piiErased ? null : self::decodeJson($o['shipping_address_json']),
+            'billing_address' => $piiErased ? null : self::decodeJson($o['billing_address_json']),
             'shipping_method' => $o['shipping_method'],
             'items' => array_map(static fn (array $i): array => [
                 'book_item_id' => (int) $i['book_item_id'],
@@ -291,7 +296,9 @@ final class OrderController extends RestController
             $view['needs_attention'] = $o['needs_attention'] === '1';
             $view['attention_reason'] = $o['attention_reason'];
             $view['user_id'] = (int) $o['user_id'];
+            $view['payment_due_extended_at'] = Db::toIso8601($o['payment_due_extended_at']);
             $view['payments'] = array_map(static fn (array $p): array => self::presentPayment($p, true), $payments);
+            $view['refunds'] = $this->loadRefunds($orderId);
         }
 
         return $view;
@@ -307,6 +314,7 @@ final class OrderController extends RestController
             'attempt_no' => (int) $p['attempt_no'],
             'status' => (string) $p['status'],
             'amount' => (int) $p['amount'],
+            'refunded_amount' => (int) $p['refunded_amount'],
             'currency' => (string) $p['currency'],
             'card_brand' => $p['card_brand'],
             'card_last4' => $p['card_last4'],
@@ -321,6 +329,37 @@ final class OrderController extends RestController
         }
 
         return $out;
+    }
+
+    /**
+     * Возвраты заказа для менеджера (ix_refunds_order): разбор needs_attention (дубль оплаты, поздний платёж).
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function loadRefunds(int $orderId): array
+    {
+        $rows = $this->db->getResults(
+            "SELECT r.id, p.attempt_no, r.amount, r.currency, r.reason, r.status, r.provider_refund_id, r.failure_message,
+                    r.requested_at, r.completed_at
+               FROM {$this->db->table('book_refunds')} r
+               JOIN {$this->db->table('book_payments')} p ON p.id = r.payment_id
+              WHERE r.order_id = %d
+              ORDER BY r.id",
+            $orderId,
+        );
+
+        return array_map(static fn (array $r): array => [
+            'id' => (int) $r['id'],
+            'payment_attempt_no' => (int) $r['attempt_no'],
+            'amount' => (int) $r['amount'],
+            'currency' => (string) $r['currency'],
+            'reason' => (string) $r['reason'],
+            'status' => (string) $r['status'],
+            'provider_refund_id' => $r['provider_refund_id'],
+            'failure_message' => $r['failure_message'],
+            'requested_at' => Db::toIso8601($r['requested_at']),
+            'completed_at' => Db::toIso8601($r['completed_at']),
+        ], $rows);
     }
 
     /** @return ?array<string, mixed> */
