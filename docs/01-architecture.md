@@ -156,6 +156,8 @@ declare(strict_types=1);
 
 defined('ABSPATH') || exit;
 
+define('UNIUNDATA_BOOKS_FILE', __FILE__);
+
 require_once __DIR__ . '/vendor/autoload.php';
 // Action Scheduler подключается файлом, а не автозагрузкой: он регистрирует свою версию
 // и на plugins_loaded инициализирует самую новую копию из всех плагинов (WooCommerce и др.).
@@ -339,7 +341,9 @@ JSON-LD. Рассмотрены два варианта.
   изменение названия при синхронизации не ломает ссылки. Отдельная колонка slug в схеме не нужна.
   Каталог и поиск: `/books/?q=…&author=…&year=…` (FULLTEXT `ft_records_main`/`ft_records_all`).
 - **Rewrite:** `add_rewrite_rule('^books/([0-9]+)(?:-([^/]+))?/?$', 'index.php?uniundata_record=$matches[1]', 'top')`
-  на `init` + `query_vars`. `flush_rewrite_rules()` вызывается только при активации и деактивации.
+  и `add_rewrite_rule('^books/?$', 'index.php?uniundata_catalog=1', 'top')` на `init` + `query_vars`.
+  `flush_rewrite_rules()` вызывается только при активации и деактивации. Страница WordPress со slug
+  `books` перекрывается правилом `top`, поэтому базовый путь витрины делается настраиваемым.
 - **Основной запрос:** `posts_pre_query` возвращает `[]` для основного запроса с `uniundata_record`, чтобы
   WordPress не искал посты. На `template_redirect` загружается запись. Неактивная запись
   (`is_active = 0`) → `$wp_query->set_404()` и `status_header(404)`.
