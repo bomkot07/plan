@@ -4,7 +4,8 @@
 **уникальные физические экземпляры книг** (один экземпляр продаётся ровно один раз).
 
 Стек: WordPress 7.1.2 · PHP 8.3+ (совместимо с 8.4) · MySQL 8.0.16+ (InnoDB) · Action Scheduler · WP-CLI.
-Целевой сервер: **shop.libsmr.ru** — PHP 8.3.27 FPM, Apache 2.4.52, MySQL 8.0.46 (см. [11-environment](docs/11-environment.md)).
+Целевой сервер: **shop.libsmr.ru** — отдельная установка WordPress рядом с основным сайтом new.libsmr.ru;
+PHP 8.3.27 FPM, Apache 2.4.52, MySQL 8.0.46 (см. [11-environment](docs/11-environment.md)). Валюта — RUB (суммы в копейках).
 
 ## Главные решения
 
@@ -17,7 +18,9 @@
 | Лимит 3 резерва | Проверка в транзакции под блокировкой экземпляра **и** в БД: `UNIQUE(user_id, book_item_id, attempt_no)` + `CHECK (attempt_no BETWEEN 1 AND 3)`. Резерв, снятый администратором, попыткой не считается (`attempt_no = NULL`) | [05-algorithms](docs/05-algorithms.md) |
 | Резерв 1 час и оплата | Час ограничивает **начало** оплаты. После «Перейти к оплате» экземпляр держится до `payment_due_at` (TTL платёжной сессии 30 мин + grace 10 мин) | [04-statuses](docs/04-statuses.md) |
 | Факт оплаты | Только серверный webhook банка с проверенной подписью и сверкой суммы, валюты и ID заказа. Идемпотентность через `wp_book_payment_events` UNIQUE(provider, event_id) и `wp_book_sales` UNIQUE(book_item_id) | [06-rest-api](docs/06-rest-api.md) |
-| Гонки | Единый порядок блокировок `carts → items → reservations → cart_items → orders → payments → payment_events`, READ COMMITTED, повтор транзакции при deadlock | [08-security-concurrency](docs/08-security-concurrency.md) |
+| Гонки | Единый порядок блокировок `carts → items → reservations → cart_items → orders → payments → payment_events → refunds`, READ COMMITTED на каждую транзакцию, повтор при deadlock | [08-security-concurrency](docs/08-security-concurrency.md) |
+| Возвраты | Решение о возврате (дубль оплаты, поздний платёж, отмена) — строка `wp_book_refunds` в той же транзакции; запрос к банку — задачей Action Scheduler с ключом идемпотентности | [05-algorithms](docs/05-algorithms.md) |
+| Чеки и ПДн | 54-ФЗ: данные для чека передаются провайдеру в `createSession` и `refund`. 152-ФЗ: отдельное согласие, обезличивание контактов по сроку хранения (`orders.pii_erased_at`) | [07-users-roles](docs/07-users-roles.md) |
 | Синхронизация | Action Scheduler / системный cron + WP-CLI, `GET_LOCK` + один `running`-прогон на источник, пакеты, upsert по checksum. Локальные `reserved/checkout_pending/sold/blocked` не перетираются, пропавшие экземпляры получают `sync_missing` | [05-algorithms](docs/05-algorithms.md) |
 | Миграции | Свой версионный мигратор, **не** `dbDelta()`: dbDelta не поддерживает generated columns, CHECK и FK | [09-migrations-tests](docs/09-migrations-tests-edge-cases.md) |
 
@@ -35,12 +38,30 @@
 10. [Сценарии из ТЗ с реальным выводом MySQL](docs/10-scenarios.md)
 11. [Окружение shop.libsmr.ru: что настроить до запуска](docs/11-environment.md)
 
+## Настройки и команды
+
+| Option (`wp_options`) | По умолчанию | Назначение |
+|---|---|---|
+| `uniundata_currency` | `RUB` (ставится при установке) | Валюта магазина. Экземпляры в другой валюте не резервируются |
+| `uniundata_max_active_reservations` | `10` | Одновременных активных резервов на пользователя |
+| `uniundata_payment_ttl_minutes` / `uniundata_payment_grace_minutes` | `30` / `10` | Срок платёжной сессии и запас на поздний webhook |
+| `uniundata_reservation_minutes` | `60` | Срок резерва (по ТЗ — ровно час) |
+| `uniundata_terms_versions` | — | Действующие версии оферты и политики ПДн (версия + SHA-256) |
+| `uniundata_receipt_vat` | `none` | Ставка НДС в чеке 54-ФЗ — задаёт бухгалтер |
+
+Секреты банка и источника — константы в `wp-config.php` или переменные окружения, не options.
+
+WP-CLI (`wp uniundata …`): `migrate [--rebuild-fulltext]` — схема; `sync run [--resume]` / `sync status` —
+синхронизация; `expire` — снять просроченные резервы и заказы; `privacy-retention` — обезличивание по срокам;
+`doctor` — проверка схемы, настроек и инвариантов (код выхода 1 при нарушениях).
+
 ## Файлы
 
 ```
 sql/schema.sql        — CREATE TABLE для всех таблиц (MySQL 8.0.16+)
 sql/queries.sql       — примеры запросов: каталог, поиск, корзина, expiry, отчёты, инварианты
-src/                  — PHP-код плагина (namespace Uniundata\Books)
+src/                  — PHP-код плагина (namespace Uniundata\Books), главный файл src/uniundata-books.php
+composer.json         — автозагрузка PSR-4 и Action Scheduler ^4.2
 tests/mysql/run.sh    — сценарии гонок на реальном MySQL 8 (параллельные сессии)
 ```
 

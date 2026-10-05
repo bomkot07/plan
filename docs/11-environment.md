@@ -68,9 +68,13 @@ define( 'DISABLE_WP_CRON', true );
 ```cron
 # crontab -u www-data -e
 * * * * *  flock -n /tmp/uniundata-as.lock  wp --path=/var/www/shop action-scheduler run --group=uniundata --batch-size=25 --quiet
-15 3 * * * flock -n /tmp/uniundata-sync.lock wp --path=/var/www/shop uniundata sync run --quiet
 */5 * * * * wp --path=/var/www/shop cron event run --due-now --quiet   # прочие задачи WordPress
 ```
+
+Ежедневную синхронизацию запускает сам Action Scheduler (recurring-задача `uniundata_sync_daily`, 03:15 UTC),
+отдельная crontab-строка для неё не нужна. Ручной запуск или продолжение после сбоя:
+`wp uniundata sync run --resume`. Повторный запуск безопасен: второй процесс получит занятый `GET_LOCK`
+и сразу завершится.
 
 `wp` — WP-CLI. Если его нет: `curl -O https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar`.
 У CLI нет лимита `max_execution_time`, а `memory_limit` для CLI задаётся в `/etc/php/8.3/cli/php.ini` (512M).
@@ -81,15 +85,19 @@ define( 'DISABLE_WP_CRON', true );
   `RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]`. Если банк передаёт подпись в заголовке
   `Authorization`, проверьте, что эта строка на месте: без неё Apache + PHP-FPM заголовок в PHP не передаёт.
   Заголовки вида `X-Signature` передаются без дополнительной настройки.
-- IP allowlist банка (если банк его публикует) можно задать на уровне Apache:
+- IP allowlist банка (если банк публикует диапазоны) включается в самом плагине: константа
+  `UNIUNDATA_WEBHOOK_ALLOWED_IPS` в `wp-config.php` проверяется в `permission_callback` webhook-а.
+  Вариант на уровне Apache хуже: WordPress принимает маршрут и как `/wp-json/...`, и как `?rest_route=...`,
+  причём без учёта регистра. Если всё же делать в Apache, учитывайте оба вида и регистр (комментарий
+  в Apache — только отдельной строкой):
 
   ```apache
-  <If "%{REQUEST_URI} =~ m#^/wp-json/uniundata/v1/payment/webhook#">
-      Require ip 203.0.113.0/24   # диапазоны из документации банка
+  # диапазоны из документации банка
+  <If "tolower(%{REQUEST_URI}) =~ m#^/wp-json/uniundata/v1/payment/webhook# || tolower(%{QUERY_STRING}) =~ m#rest_route=/uniundata/v1/payment/webhook#">
+      Require ip 203.0.113.0/24
   </If>
   ```
-  WordPress принимает REST-запросы и как `?rest_route=/uniundata/v1/…`, поэтому основная защита — подпись,
-  а allowlist — дополнительный слой (плагин дублирует его в `permission_callback`).
+  Главная защита в любом случае — подпись банка, allowlist — дополнительный слой.
 - Page cache (если будет) не должен кэшировать `/wp-json/uniundata/*`, корзину, checkout и страницу возврата из банка.
 - Обязателен HTTPS (HSTS), иначе cookie-аутентификация и nonce теряют смысл.
 
@@ -131,13 +139,14 @@ wp_remote_post( $url, [
 Ключи банка и источника каталога хранятся в `wp-config.php` магазина (или в переменных окружения пула
 FPM: `env[UNIUNDATA_BANK_SECRET] = …` в конфиге пула), но не в `wp_options` и не в репозитории.
 
-## 11.3 Мультисайт или две установки
+## 11.3 Две отдельные установки WordPress
 
-Ответа заказчика пока нет. Имя БД `new_libsmr` допускает оба варианта:
+Заказчик подтвердил: shop.libsmr.ru и new.libsmr.ru — **две отдельные установки** со своими `wp_users`.
 
-| Вариант | Таблицы плагина | Пользователи | Что учесть |
-|---|---|---|---|
-| Две отдельные установки WordPress | `wp_book_*` в БД магазина | Отдельные `wp_users` у сайта и магазина | Регистрация покупателя в магазине или SSO (см. 07) |
-| Мультисеть, магазин — подсайт | `wp_N_book_*` (`$wpdb->prefix` подсайта) | Общие `wp_users` | Плагин активируется только на подсайте магазина (не network-wide), роли назначаются на подсайте |
-
-Схема готова к обоим вариантам: префикс подставляется мигратором, имена ограничений не конфликтуют.
+- Плагин ставится только на shop.libsmr.ru, его таблицы — `wp_book_*` в БД магазина.
+- Покупатель регистрируется в магазине (роль `book_customer`). Единый вход с основным сайтом — отдельная
+  необязательная задача (OpenID Connect или плагин SSO), см. 07.
+- Обе установки работают на одном сервере MySQL, поэтому имена `GET_LOCK` плагина содержат хэш БД и префикса
+  (`Db::lockName()`). Имена CHECK и FK содержат имя таблицы, поэтому даже установка в одну БД с другим
+  префиксом не конфликтует (проверено тестом).
+- Валюта магазина — **RUB** (суммы в копейках). Мигратор при установке ставит option `uniundata_currency = 'RUB'`.
