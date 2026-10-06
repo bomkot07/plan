@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Uniundata\Books\Service;
 
+use Uniundata\Books\Domain\ItemStatus;
 use Uniundata\Books\Infrastructure\AuditLog;
 use Uniundata\Books\Infrastructure\Db;
 use Uniundata\Books\Payment\PaymentProviderInterface;
@@ -270,11 +271,7 @@ final class OrderExpiryService
                 ...$pending
             ), count($pending), 'items → release target');
             foreach ($pending as $id) {
-                $to = match ((string) $items[$id]['source_status']) {
-                    'missing' => 'sync_missing',
-                    'withdrawn' => 'withdrawn',
-                    default => 'available',
-                };
+                $to = ItemStatus::releaseTarget((string) $items[$id]['source_status'])->value;
                 $this->audit->record('item.status_changed', 'item', $id, 'checkout_pending', $to, ['order_id' => $orderId, 'reason' => 'order_expired'], 'cron');
             }
         }
@@ -333,11 +330,6 @@ final class OrderExpiryService
     private function col(string $sql, int|string|float ...$args): array
     {
         return array_map(static fn (array $r): string => (string) array_values($r)[0], $this->db->getResults($sql, ...$args));
-    }
-
-    private function scalar(string $sql, int|string|float ...$args): ?string
-    {
-        return $this->db->getVar($sql, ...$args);
     }
 
     /** INSERT/UPDATE: число изменённых строк (UPDATE теми же значениями даёт 0). Ошибка MySQL → исключение. */

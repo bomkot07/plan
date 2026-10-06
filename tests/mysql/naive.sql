@@ -144,6 +144,7 @@ BEGIN
   WHILE v_i <= 2 DO
     SET v_t = IF(v_i = 1, p_first, p_second), v_id = IF(v_i = 1, p_first_id, p_second_id);
     CASE v_t
+      WHEN 'records' THEN SELECT source_record_id INTO v_x FROM wp_book_records WHERE id = v_id FOR UPDATE;
       WHEN 'items' THEN SELECT availability_status INTO v_x FROM wp_book_items WHERE id = v_id FOR UPDATE;
       WHEN 'orders' THEN SELECT status INTO v_x FROM wp_book_orders WHERE id = v_id FOR UPDATE;
       WHEN 'carts' THEN SELECT status INTO v_x FROM wp_book_carts WHERE id = v_id FOR UPDATE;

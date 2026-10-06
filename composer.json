@@ -1,0 +1,31 @@
+{
+    "name": "uniundata/books",
+    "description": "Uniundata Books: WordPress plugin for a shop of unique book copies (MARC 21 catalog sync, 1-hour reservations, orders, bank payments).",
+    "type": "wordpress-plugin",
+    "license": "GPL-2.0-or-later",
+    "require": {
+        "php": ">=8.3",
+        "ext-ctype": "*",
+        "ext-dom": "*",
+        "ext-json": "*",
+        "ext-libxml": "*",
+        "ext-mbstring": "*",
+        "ext-mysqli": "*",
+        "woocommerce/action-scheduler": "^4.2"
+    },
+    "suggest": {
+        "ext-intl": "Unicode NFC normalization of MARC 21 fields (Normalizer); without it values are stored as received"
+    },
+    "autoload": {
+        "psr-4": {
+            "Uniundata\\Books\\": "src/"
+        }
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "sort-packages": true,
+        "platform": {
+            "php": "8.3.27"
+        }
+    }
+}

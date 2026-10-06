@@ -1,10 +1,12 @@
 # 02. ER-диаграмма
 
 Источник истины — `sql/schema.sql` (схема v2, MySQL 8.0.16+, InnoDB, проверена на 8.0.46). Ниже — **все 21
-таблица плагина** и две сущности ядра WordPress (`wp_users`, `wp_posts`). Префикс `wp_` условный: мигратор
-заменяет его на `$wpdb->prefix`, а `wp_users` в запросах — это `$wpdb->users` (в мультисайте таблица общая для
-сети). Имена FOREIGN KEY начинаются с имени таблицы (`wp_book_items_fk_record`) и меняются вместе с префиксом
-(`wp_2_book_items_fk_record`): в MySQL имена FK и CHECK уникальны в пределах всей БД
+таблица плагина** и две сущности ядра WordPress (`wp_users`, `wp_posts`). `wp_users` — пользователи магазина
+`shop.libsmr.ru`: это отдельная от `new.libsmr.ru` установка WordPress, покупатель регистрируется в магазине.
+Префикс `wp_` условный: мигратор заменяет его на `$wpdb->prefix`, `wp_users` в запросах — `$wpdb->users`
+(в мультисайте таблица общая для сети). Имена FOREIGN KEY начинаются с имени таблицы (`wp_book_items_fk_record`)
+и меняются вместе с префиксом (`wp_2_book_items_fk_record`): имена FK и CHECK в MySQL уникальны в пределах всей
+БД, а в одной БД могут оказаться мультисайт, вторая установка или staging с другим префиксом
 ([03, раздел 7](03-tables-and-indexes.md#7-check-ограничения-и-имена-ограничений)).
 
 ## Легенда
@@ -140,8 +142,8 @@ erDiagram
         varchar source_name UK "uq_items_external 1 из 2"
         varchar external_item_id UK "uq_items_external 2 из 2, внешний book_id"
         varchar inventory_number UK "uq_items_inventory, NULL допустим"
-        int price_amount "больше 0, минимальные единицы"
-        char currency "ISO 4217"
+        int price_amount "больше 0, в копейках"
+        char currency "ISO 4217, валюта магазина RUB"
         varchar availability_status "7 статусов"
         varchar source_status "present, missing, withdrawn"
         datetime sold_at "заполнен тогда и только тогда, когда sold"
@@ -289,7 +291,7 @@ erDiagram
         varchar provider UK "uq_payments_provider_id 1 из 2"
         varchar provider_payment_id UK "uq_payments_provider_id 2 из 2"
         varchar status "9 статусов"
-        int amount "больше 0"
+        int amount "больше 0, в копейках"
         int refunded_amount "не больше amount"
         varchar session_redirect_url "страница оплаты банка"
         char card_last4 "только 4 цифры"

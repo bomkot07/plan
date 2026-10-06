@@ -229,7 +229,8 @@ BEGIN
                           OR p_msg LIKE '%uq_cart_items_one_active_per_item%') THEN
     RETURN 'uniundata_item_unavailable';
   ELSEIF (p_errno = 1062 AND p_msg LIKE '%uq_reservations_attempt%')
-      OR (p_errno = 3819 AND p_msg LIKE '%ck_reservations_attempt_range%') THEN
+      OR (p_errno = 3819 AND p_msg LIKE '%\_chk\_attempt\_range%') THEN
+    -- как Db::isCheckViolation(): имя CHECK сравнивается по суффиксу (<prefix>book_reservations_chk_attempt_range)
     RETURN 'uniundata_reservation_limit_reached';
   ELSEIF p_errno IN (1213, 1205) THEN
     -- PHP Db::transaction() повторил бы до 3 раз; тест повторов не делает, чтобы увидеть каждый deadlock.
@@ -246,6 +247,10 @@ BEGIN
     WHEN 'uniundata_reservation_expired' THEN 410
     WHEN 'uniundata_item_unavailable' THEN 409
     WHEN 'uniundata_reservation_limit_reached' THEN 409
+    WHEN 'uniundata_active_reservation_limit' THEN 409
+    WHEN 'uniundata_reservation_not_found' THEN 404
+    WHEN 'uniundata_order_not_cancellable' THEN 409
+    WHEN 'uniundata_payment_provider_error' THEN 502
     WHEN 'uniundata_cart_empty' THEN 409
     WHEN 'uniundata_cart_changed' THEN 409
     WHEN 'uniundata_order_not_payable' THEN 409
@@ -253,7 +258,7 @@ BEGIN
     ELSE 500 END;
 END$$
 
--- UUID v4 (как wp_generate_uuid4()): нужен для ck_orders_public_id.
+-- UUID v4 (как wp_generate_uuid4()): нужен для wp_book_orders_chk_public_id.
 CREATE FUNCTION f_uuid4() RETURNS CHAR(36) NOT DETERMINISTIC NO SQL
 BEGIN
   DECLARE h CHAR(32) DEFAULT LOWER(HEX(RANDOM_BYTES(16)));

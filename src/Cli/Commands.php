@@ -295,6 +295,9 @@ final class Commands
         if ($r['rebuilt'] !== []) {
             \WP_CLI::log('FULLTEXT rebuilt: ' . implode(', ', $r['rebuilt']));
         }
+        if ($r['options_added'] !== []) {
+            \WP_CLI::log('Default options added: ' . implode(', ', $r['options_added']));
+        }
         \WP_CLI::success($r['applied'] === []
             ? \sprintf('Schema is up to date (version %d). Roles v%d.', $r['to'], Roles::VERSION)
             : \sprintf('Migrated schema %d → %d (applied: %s). Roles v%d.', $r['from'], $r['to'], implode(', ', $r['applied']), Roles::VERSION));

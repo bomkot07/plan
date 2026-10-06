@@ -235,7 +235,7 @@ final class ReservationService
                 'status' => null,
                 'items' => [],
                 'items_count' => 0,
-                'totals' => [],
+                'totals' => new \stdClass(), // в JSON всегда объект {"RUB": 12300}, а не [] у пустой корзины
                 'subtotal_amount' => 0,
                 'currency' => null,
                 'expires_at' => null,
@@ -302,7 +302,7 @@ final class ReservationService
             'status' => (string) $cart['status'],
             'items' => $items,
             'items_count' => \count(array_filter($items, static fn (array $i): bool => !$i['is_expired'])),
-            'totals' => $totals,
+            'totals' => (object) $totals,
             // Позиции в разных валютах возможны только после смены uniundata_currency: тогда не суммируем,
             // клиент смотрит totals.
             'subtotal_amount' => \count($totals) <= 1 ? (int) array_sum($totals) : null,
@@ -437,6 +437,8 @@ final class ReservationService
     /**
      * @internal Пересчёт корзины после изменения её позиций. Вызывающий держит FOR UPDATE корзины,
      *           поэтому обычное чтение cart_items стабильно: все, кто меняет позиции, сначала берут корзину.
+     *           Действие покупателя ($touchActivity: reserve, remove-item) возвращает checkout_started → active:
+     *           состав изменился, оформление начинается заново (docs/04).
      *
      * @param CartRow     $cart
      * @param string|null $closeEmptyAs 'expired' — закрыть корзину, если активных позиций не осталось
@@ -495,9 +497,19 @@ final class ReservationService
             $sets[] = 'last_activity_at = %s';
             $args[] = $now;
         }
+        $restart = $touchActivity && $cart['status'] === 'checkout_started';
+        if ($restart) {
+            $sets[] = "status = 'active'";
+            $sets[] = 'checkout_started_at = NULL';
+        }
         $args[] = $cart['id'];
         // Число строк не проверяем: UPDATE теми же значениями даёт 0 affected rows.
         $this->db->execute("UPDATE {$this->t('carts')} SET " . implode(', ', $sets) . ' WHERE id = %d', ...$args);
+        if ($restart) {
+            $this->audit->record('cart.status_changed', 'cart', $cart['id'], 'checkout_started', 'active', [
+                'reason' => 'cart_modified',
+            ], $actorType, $actorUserId);
+        }
 
         return false;
     }

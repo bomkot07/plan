@@ -9,6 +9,8 @@ use Uniundata\Books\Domain\ItemStatus;
 use Uniundata\Books\Domain\ReservationStatus;
 use Uniundata\Books\Infrastructure\AuditLog;
 use Uniundata\Books\Infrastructure\Db;
+use Uniundata\Books\Plugin;
+use Uniundata\Books\Service\PaymentService;
 use Uniundata\Books\Service\ReservationService;
 use Uniundata\Books\Sync\SourceClientInterface;
 use Uniundata\Books\Sync\SyncService;
@@ -25,6 +27,8 @@ use Uniundata\Books\Sync\SyncService;
  *                                           409 (сначала отмена заказа менеджером заказов);
  *   POST /admin/items/{id}/unblock        — manage_book_catalog: blocked → release target по source_status
  *                                           (available | sync_missing | withdrawn);
+ *   POST /admin/orders/{public_order_id}/refunds — manage_book_orders: возврат денег по решению менеджера
+ *                                           (строка wp_book_refunds + задача AS uniundata_refund_payment, 202);
  *   POST /admin/sync/run                  — manage_book_sync: поставить синхронизацию в Action Scheduler (202);
  *   GET  /admin/sync/runs                 — manage_book_sync: журнал прогонов.
  */
@@ -38,13 +42,19 @@ final class AdminController extends RestController
     public const AS_GROUP = 'uniundata';
 
     private const SYNC_STATUSES = ['running', 'succeeded', 'partial', 'failed', 'aborted'];
-    /** Имя источника — как проверяет SyncService::__construct() (и ≤ 64 символов имени GET_LOCK). */
-    private const SOURCE_PATTERN = '^[a-z0-9_-]{1,32}$';
+    /** Причины возврата по решению менеджера (= PaymentService::requestRefund()). */
+    private const REFUND_REASONS = ['order_cancelled', 'customer_return', 'manual'];
 
+    /**
+     * @param (\Closure(): PaymentService)|null $payments PaymentService создаётся лениво, только на маршруте
+     *                                                    возврата: без настроенного банка он не создаётся,
+     *                                                    а остальные админ-маршруты должны работать.
+     */
     public function __construct(
         AuditLog $audit,
         private readonly Db $db,
         private readonly ReservationService $reservations,
+        private readonly ?\Closure $payments = null,
     ) {
         parent::__construct($audit);
     }
@@ -78,6 +88,36 @@ final class AdminController extends RestController
             ]);
         }
 
+        register_rest_route(self::NAMESPACE, '/admin/orders/(?P<public_order_id>' . OrderController::PUBLIC_ID_REGEX . ')/refunds', [
+            'methods' => \WP_REST_Server::CREATABLE,
+            'callback' => [$this, 'requestRefund'],
+            'permission_callback' => $this->requireCapability('manage_book_orders'),
+            'args' => [
+                'amount' => [
+                    'description' => 'Сумма возврата в минимальных единицах валюты заказа (копейки).',
+                    'type' => 'integer',
+                    'minimum' => 1,
+                    'required' => true,
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'reason' => [
+                    'description' => 'Причина: order_cancelled | customer_return | manual.',
+                    'type' => 'string',
+                    'enum' => self::REFUND_REASONS,
+                    'required' => true,
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+                'payment_attempt' => [
+                    'description' => 'attempt_no платежа (по умолчанию — платёж, которым оплачен заказ).',
+                    'type' => 'integer',
+                    'minimum' => 1,
+                    'required' => false,
+                    'validate_callback' => 'rest_validate_request_arg',
+                ],
+            ],
+            'show_in_index' => false,
+        ]);
+
         register_rest_route(self::NAMESPACE, '/admin/sync/run', [
             'methods' => \WP_REST_Server::CREATABLE,
             'callback' => [$this, 'runSync'],
@@ -86,7 +126,7 @@ final class AdminController extends RestController
                 'source' => [
                     'description' => 'Код источника (wp_book_sync_runs.source_name), зарегистрированного фильтром uniundata_sync_sources.',
                     'type' => 'string',
-                    'pattern' => self::SOURCE_PATTERN,
+                    'pattern' => SyncService::SOURCE_NAME_PATTERN,
                     'default' => 'primary',
                     'validate_callback' => 'rest_validate_request_arg',
                     'sanitize_callback' => 'sanitize_key',
@@ -103,7 +143,7 @@ final class AdminController extends RestController
                 'source' => [
                     'description' => 'Фильтр по источнику.',
                     'type' => 'string',
-                    'pattern' => self::SOURCE_PATTERN,
+                    'pattern' => SyncService::SOURCE_NAME_PATTERN,
                     'required' => false,
                     'validate_callback' => 'rest_validate_request_arg',
                     'sanitize_callback' => 'sanitize_key',
@@ -292,6 +332,55 @@ final class AdminController extends RestController
     }
 
     // =============================================================================================
+    // Возвраты
+    // =============================================================================================
+
+    /**
+     * Возврат по решению менеджера (customer_return, manual, order_cancelled). Решение — строка wp_book_refunds
+     * (requested) в транзакции под блокировкой заказа и платежа; деньги возвращает задача AS
+     * uniundata_refund_payment {refund_id} → PaymentService::processRefund(). Ответ 202 + refund_id.
+     * Ошибки: 404 uniundata_order_not_found; 400 uniundata_invalid_param (amount — больше остатка,
+     * payment_id — платёж не оплачен/не найден).
+     */
+    public function requestRefund(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
+    {
+        return $this->respond($request, function () use ($request): \WP_REST_Response {
+            $this->enforceRateLimit('admin_write');
+            $order = $this->db->getRow(
+                "SELECT id FROM {$this->db->table('book_orders')} WHERE public_order_id = %s",
+                (string) $request->get_param('public_order_id'),
+            );
+            if ($order === null) {
+                throw DomainError::orderNotFound();
+            }
+            $orderId = (int) $order['id'];
+            $paymentId = null;
+            $attempt = $request->get_param('payment_attempt');
+            if ($attempt !== null) {
+                $id = $this->db->getVar(
+                    "SELECT id FROM {$this->db->table('book_payments')} WHERE order_id = %d AND attempt_no = %d",
+                    $orderId,
+                    (int) $attempt,
+                );
+                if ($id === null) {
+                    throw DomainError::invalidParam('payment_attempt', \__('No such payment attempt for this order.', 'uniundata-books'));
+                }
+                $paymentId = (int) $id;
+            }
+            $payments = $this->payments !== null ? ($this->payments)() : Plugin::instance()->get(PaymentService::class);
+            $refundId = $payments->requestRefund(
+                $orderId,
+                (int) $request->get_param('amount'),
+                (string) $request->get_param('reason'),
+                $this->currentUserId(),
+                $paymentId,
+            );
+
+            return new \WP_REST_Response(['refund_id' => $refundId, 'status' => 'requested'], 202);
+        });
+    }
+
+    // =============================================================================================
     // Синхронизация
     // =============================================================================================
 
@@ -300,10 +389,9 @@ final class AdminController extends RestController
      * Защита от параллельных прогонов — в SyncService (GET_LOCK + uq_sync_runs_one_running); здесь —
      * быстрый ответ «уже идёт / уже в очереди».
      *
-     * Флаг unique у as_enqueue_async_action не используется: в Action Scheduler 3.x уникальность — hook + group
-     * БЕЗ args (проверено по 3.9.0), и ожидающая ежедневная recurring-задача того же hook-а блокировала бы
-     * ручной запуск навсегда. Вместо него — as_has_scheduled_action() с args; редкий двойной клик двух
-     * администраторов даст две задачи, вторая получит от SyncService «locked/busy» и ничего не сделает.
+     * «Уже в очереди» — as_has_scheduled_action() с args ['admin', source] (ежедневная recurring-задача того же
+     * hook-а — с другими args и ручной запуск не блокирует). Редкий двойной клик двух администраторов даст две
+     * задачи; вторая получит от SyncService «locked/busy» и ничего не сделает.
      */
     public function runSync(\WP_REST_Request $request): \WP_REST_Response|\WP_Error
     {
@@ -411,7 +499,7 @@ final class AdminController extends RestController
             $total = (int) $this->db->getVar("SELECT COUNT(*) FROM {$table} WHERE {$whereSql}", ...$args);
             $rows = $total === 0 ? [] : $this->db->getResults(
                 "SELECT id, source_name, triggered_by, status, started_at, heartbeat_at, finished_at, source_cursor,
-                        records_received, records_created, records_updated, records_skipped,
+                        resumed_from_run_id, pass_started_run_id, records_received, records_created, records_updated, records_skipped,
                         items_created, items_updated, items_skipped, items_conflicts, items_missing, items_withdrawn,
                         errors_count, error_log
                    FROM {$table}
@@ -431,7 +519,10 @@ final class AdminController extends RestController
 
                 return self::presentRun($r) + [
                     'finished_at' => Db::toIso8601($r['finished_at']),
+                    // NULL — читать источник с начала; '' — источник прочитан, идёт проход «пропавших».
                     'source_cursor' => $r['source_cursor'],
+                    'resumed_from_run_id' => $r['resumed_from_run_id'] !== null ? (int) $r['resumed_from_run_id'] : null,
+                    'pass_started_run_id' => $r['pass_started_run_id'] !== null ? (int) $r['pass_started_run_id'] : null,
                     'counters' => $counters,
                     'error_log' => \is_array($errors) ? $errors : null,
                 ];

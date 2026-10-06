@@ -13,7 +13,7 @@ use Uniundata\Books\Service\ReservationExpiryService;
 use Uniundata\Books\Sync\SyncService;
 
 /**
- * Фоновые задачи на Action Scheduler (standalone-библиотека, composer woocommerce/action-scheduler ^3.9 || ^4),
+ * Фоновые задачи на Action Scheduler (standalone-библиотека, composer woocommerce/action-scheduler ^4.2),
  * группа 'uniundata'. Здесь — постановка recurring-задач и обработчики ВСЕХ задач плагина:
  *
  *   recurring  uniundata_expire_reservations  60 с        ReservationExpiryService::expireDue()
@@ -34,10 +34,10 @@ use Uniundata\Books\Sync\SyncService;
  * Корректность не зависит от точности cron: сроки резервов и заказов сравниваются с UTC_TIMESTAMP(6)
  * в каждой операции; задача лишь освобождает экземпляры для других покупателей.
  *
- * Дубли задач. Флаг unique в AS 3.9 сравнивает только hook + group (без args), в 4.x — ещё и args, поэтому
- * unique = true ставится лишь там, где потеря «лишней» задачи безвредна (recurring без args, догоняющий
- * проход expiry). Задачи с аргументами ставятся без unique, а обработчики идемпотентны: при повторе
- * перепроверяют состояние в БД (возврат — по статусу строки wp_book_refunds, письмо — по записи аудита).
+ * Дубли задач. Нужен AS ≥ 4.2: там unique сравнивает hook + group + args среди pending/running (в 3.x — без
+ * args, и задача по другому заказу молча терялась бы). unique лишь экономит дубли; защита от них — идемпотентные
+ * обработчики: при повторе они перепроверяют состояние в БД (возврат — по статусу строки wp_book_refunds,
+ * письмо — по записи аудита). Версию AS проверяет Plugin::configProblems().
  *
  * Action Scheduler вызывает обработчик как do_action_ref_array($hook, array_values($args)) — аргументы
  * приходят ПОЗИЦИОННО, поэтому сигнатуры ниже повторяют порядок ключей в местах постановки.
@@ -61,8 +61,17 @@ final class Scheduler
         self::HOOK_EXPIRE_RESERVATIONS, self::HOOK_EXPIRE_ORDERS, self::HOOK_SYNC_DAILY,
         self::HOOK_ABANDON_CARTS, self::HOOK_PRIVACY_RETENTION,
     ];
+    /** Разовые задачи. Хуки группы вне RECURRING_HOOKS + ASYNC_HOOKS считаются снятыми (имена прежних версий). */
+    public const ASYNC_HOOKS = [
+        self::HOOK_ORDER_PAID, self::HOOK_REFUND, self::HOOK_ATTENTION, self::HOOK_USER_CLEANUP,
+        SyncService::HOOK_CONTINUE, SyncService::HOOK_ALERT,
+    ];
 
-    public const SCHEDULE_VERSION = 2;
+    /** Минимальная версия Action Scheduler: unique с учётом args. */
+    public const MIN_ACTION_SCHEDULER_VERSION = '4.2.0';
+
+    /** Поднимать при смене набора/расписания recurring-задач: они пересоздаются, снятые хуки отменяются. */
+    public const SCHEDULE_VERSION = 3;
     public const SCHEDULE_VERSION_OPTION = 'uniundata_schedule_version';
 
     /** Action Scheduler считает cron-выражения в UTC. */
@@ -112,8 +121,9 @@ final class Scheduler
 
     /**
      * Идемпотентная постановка recurring-задач. Вызывается на каждом запросе (action_scheduler_init), поэтому
-     * проверка в БД — не чаще раза в 10 минут (transient), а при смене SCHEDULE_VERSION — пересоздание.
-     * При отстающей схеме не ставится ничего.
+     * проверка в БД — не чаще раза в 10 минут (transient). При смене SCHEDULE_VERSION recurring-задачи
+     * пересоздаются, а ожидающие задачи группы со снятыми хуками (например, переименованная в v2 задача
+     * брошенных корзин) отменяются. При отстающей схеме не ставится ничего.
      */
     public function ensureRecurring(): void
     {
@@ -125,9 +135,10 @@ final class Scheduler
             return;
         }
         if ($versionChanged) {
-            foreach (array_merge(self::RECURRING_HOOKS, ['uniundata_abandon_stale_carts']) as $hook) { // + имя из черновика v1
+            foreach (self::RECURRING_HOOKS as $hook) {
                 as_unschedule_all_actions($hook, [], self::GROUP);
             }
+            $this->cancelRetiredActions();
         }
 
         $now = time();
@@ -244,8 +255,7 @@ final class Scheduler
         switch ($result['status']) {
             case 'running':
                 if ($result['continue'] && $result['run_id'] !== null) {
-                    // Без unique: дубль шага безвреден (второй получит locked/busy и цепочку не продолжит),
-                    // а в AS 3.9 unique без учёта args мог бы «съесть» шаг другого источника.
+                    // Без unique: дубль шага безвреден (второй получит locked/busy и цепочку не продолжит).
                     as_enqueue_async_action(SyncService::HOOK_CONTINUE, ['source' => $source, 'run_id' => $result['run_id']], self::GROUP);
                 }
 
@@ -427,6 +437,30 @@ final class Scheduler
         error_log(\sprintf('[uniundata] %s postponed: database schema is not up to date', $hook ?? 'recurring task'));
 
         return false;
+    }
+
+    /**
+     * Отменяет ожидающие задачи группы, чьих хуков в этой версии нет: обработчик у них не зарегистрирован,
+     * и AS выполнял бы их вхолостую (recurring — бесконечно). Вызывается только при смене SCHEDULE_VERSION.
+     */
+    private function cancelRetiredActions(): void
+    {
+        if (!class_exists(\ActionScheduler_Store::class)) {
+            return;
+        }
+        $known = array_merge(self::RECURRING_HOOKS, self::ASYNC_HOOKS);
+        $store = \ActionScheduler_Store::instance();
+        $ids = as_get_scheduled_actions(
+            ['group' => self::GROUP, 'status' => \ActionScheduler_Store::STATUS_PENDING, 'per_page' => 1000],
+            'ids',
+        );
+        foreach ($ids as $id) {
+            $hook = $store->fetch_action((int) $id)->get_hook();
+            if (!\in_array($hook, $known, true)) {
+                $store->cancel_action((int) $id);
+                error_log(\sprintf('[uniundata] retired action #%d (%s) cancelled', (int) $id, $hook));
+            }
+        }
     }
 
     private function alreadyDone(Db $db, string $action, string $entityType, int $entityId): bool

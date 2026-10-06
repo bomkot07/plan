@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Uniundata\Books\Install;
 
 use Uniundata\Books\Infrastructure\Db;
+use Uniundata\Books\Payment\FiscalReceipt;
+use Uniundata\Books\Service\ReservationService;
 
 /**
  * Версионные миграции схемы (option `uniundata_db_version`).
@@ -35,7 +37,8 @@ use Uniundata\Books\Infrastructure\Db;
  *
  * Запуск: register_activation_hook и plugins_loaded при отставании версии (Plugin). Одновременные запросы
  * сериализуются GET_LOCK(Db::lockName('migrate')); основной путь в продакшене — шаг деплоя
- * `wp uniundata migrate`.
+ * `wp uniundata migrate`. Каждый запуск добавляет недостающие options магазина (DEFAULT_OPTIONS, add_option:
+ * значения, заданные администратором, не перезаписываются).
  *
  * Будущие миграции — expand → migrate → contract: m002 добавляет nullable-колонку
  * (`ALTER TABLE … ADD COLUMN …, ALGORITHM=INSTANT` после проверки columnExists()), данные переносятся
@@ -57,6 +60,22 @@ final class Migrator
     /** @var array<int, string> версия → метод */
     private const MIGRATIONS = [
         1 => 'm001InitialSchema',
+    ];
+
+    /**
+     * Options по умолчанию: имя → [значение, autoload]. Валюта магазина shop.libsmr.ru — RUB (суммы в копейках);
+     * ставка НДС для чеков 54-ФЗ — 'none' до решения бухгалтера (FiscalReceipt). Секретов здесь нет: ключи
+     * банка и источника — в wp-config.php / окружении.
+     */
+    public const DEFAULT_OPTIONS = [
+        'uniundata_currency' => ['RUB', true],
+        'uniundata_max_active_reservations' => [ReservationService::DEFAULT_MAX_ACTIVE_RESERVATIONS, true],
+        FiscalReceipt::OPTION_VAT => ['none', true],
+        'uniundata_payment_ttl_minutes' => [30, true],
+        'uniundata_payment_grace_minutes' => [10, true],
+        'uniundata_reservation_minutes' => [60, true], // менять только вместе с бизнес-правилами
+        'uniundata_sync_source' => ['primary', false],
+        'uniundata_terms_versions' => [[], false], // заполняет администратор: version + sha256 оферты и политики
     ];
 
     /** Таблицы, которые должны существовать после миграций (без префикса). */
@@ -86,7 +105,7 @@ final class Migrator
      * @param int  $lockTimeoutSeconds Сколько ждать чужую миграцию (активация/WP-CLI — 30 с, веб-запрос — 0–5 с).
      * @param bool $rebuildFulltext    Перестроить все FULLTEXT-индексы (`wp uniundata migrate --rebuild-fulltext`):
      *                                 после смены innodb_ft_min_token_size или для таблиц, созданных вручную.
-     * @return array{from: int, to: int, applied: list<int>, rebuilt: list<string>}
+     * @return array{from: int, to: int, applied: list<int>, rebuilt: list<string>, options_added: list<string>}
      * @throws \RuntimeException окружение не подходит, блокировка занята, DDL не выполнился или схема расходится.
      */
     public function migrate(int $lockTimeoutSeconds = 30, bool $rebuildFulltext = false): array
@@ -120,11 +139,33 @@ final class Migrator
                 }
             }
             $this->assertSchema();
+            $optionsAdded = $this->installDefaultOptions();
 
-            return ['from' => $from, 'to' => max($from, self::VERSION), 'applied' => $applied, 'rebuilt' => $rebuilt];
+            return [
+                'from' => $from, 'to' => max($from, self::VERSION), 'applied' => $applied, 'rebuilt' => $rebuilt,
+                'options_added' => $optionsAdded,
+            ];
         } finally {
             $this->db->releaseLock(self::LOCK);
         }
+    }
+
+    /**
+     * add_option для отсутствующих DEFAULT_OPTIONS. Существующее значение (в том числе изменённое
+     * администратором) не трогается.
+     *
+     * @return list<string> Добавленные options.
+     */
+    public function installDefaultOptions(): array
+    {
+        $added = [];
+        foreach (self::DEFAULT_OPTIONS as $name => [$value, $autoload]) {
+            if (add_option($name, $value, '', $autoload)) {
+                $added[] = $name;
+            }
+        }
+
+        return $added;
     }
 
     public function storedVersion(): int

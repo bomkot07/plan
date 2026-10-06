@@ -24,13 +24,13 @@ read -r -a MYSQL_OPTS <<<"${MYSQL_ARGS:--uroot}"
 MYSQL=(mysql "${MYSQL_OPTS[@]}" --default-character-set=utf8mb4)
 FILTERS=("$@")
 
-# Сессия как у плагина (Db::ensureSession): UTC, READ COMMITTED, lock wait timeout 5 c.
+# Сессия как у плагина (Db::transaction): UTC, READ COMMITTED, lock wait timeout 5 c.
 # SET NAMES — как $wpdb->set_charset() при DB_COLLATE = utf8mb4_unicode_520_ci.
 INIT="SET NAMES utf8mb4 COLLATE utf8mb4_unicode_520_ci; SET time_zone = '+00:00'; \
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED; SET SESSION innodb_lock_wait_timeout = 5; \
 SET SESSION group_concat_max_len = 1048576;"
 
-PASS=0; FAIL=0; XFAIL=0; XPASS=0
+PASS=0; FAIL=0; XFAIL=0
 FAILED=()
 PIDS=()
 SCN="-"
@@ -91,25 +91,14 @@ bad() {
 # check ID "описание" "фактическое" "ожидаемое"
 check() { if [[ "$3" == "$4" ]]; then ok "$1" "$2 [$3]"; else bad "$1" "$2" "$4" "$3"; fi; }
 checkq() { check "$1" "$2" "$(q "$3" 2>&1)" "$4"; }
-# Известный дефект (EXPECTED-FAIL): не валит прогон, но печатается; если вдруг прошёл — XPASS.
-xcheck() {
-  local id=$1 desc=$2 actual=$3 expected=$4 why=$5
-  if [[ "$actual" == "$expected" ]]; then
-    XPASS=$((XPASS + 1)); printf '  XPASS  %-8s %s [%s] — дефект больше не воспроизводится, снимите пометку\n' "$id" "$desc" "$actual"
-  else
-    XFAIL=$((XFAIL + 1))
-    printf '  XFAIL  %-8s %s\n           ожидалось: %s; получено: %s\n           EXPECTED-FAIL (дефект схемы): %s\n' \
-      "$id" "$desc" "$expected" "$actual" "$why"
-  fi
-}
-# Вероятностный известный дефект: проявился → XFAIL с пояснением; не проявился в этом прогоне → INFO.
+# Вероятностное известное поведение: проявилось → XFAIL с пояснением (прогон не валит); не проявилось → INFO.
 xflaky() {
   local id=$1 desc=$2 actual=$3 expected=$4 why=$5
   if [[ "$actual" == "$expected" ]]; then
-    printf '  INFO   %-8s %s [%s] — вероятностный дефект в этом прогоне не проявился\n' "$id" "$desc" "$actual"
+    printf '  INFO   %-8s %s [%s] — в этом прогоне не проявилось\n' "$id" "$desc" "$actual"
   else
     XFAIL=$((XFAIL + 1))
-    printf '  XFAIL  %-8s %s\n           ожидалось: %s; получено: %s\n           EXPECTED-FAIL (дефект схемы): %s\n' \
+    printf '  XFAIL  %-8s %s\n           ожидалось: %s; получено: %s\n           EXPECTED-FAIL: %s\n' \
       "$id" "$desc" "$expected" "$actual" "$why"
   fi
 }
@@ -157,7 +146,7 @@ cart_total() {
 mk_order() {
   local user=$1 it; shift
   for it in "$@"; do setup "CALL a_reserve($user, $it);"; done
-  setup "CALL a_checkout($user, '$(uuid)', $(cart_total "$user"), 'EUR');"
+  setup "CALL a_checkout($user, '$(uuid)', $(cart_total "$user"), 'RUB');"
   q "SELECT id FROM wp_book_orders WHERE user_id = $user ORDER BY id DESC LIMIT 1"
 }
 pp_of() { q "SELECT provider_payment_id FROM wp_book_payments WHERE order_id = $1 ORDER BY attempt_no DESC LIMIT 1"; }
@@ -193,59 +182,57 @@ echo "загружено: schema.sql ($(q "SELECT COUNT(*) FROM information_sche
 # S0. Гарантии схемы
 # ======================================================================================
 s0() {
-  section S0 "Гарантии схемы: CHECK / UNIQUE / FK / generated columns / индексы"
+  section S0 "Гарантии схемы: CHECK / UNIQUE / FK / generated columns / FULLTEXT / префикс"
   SCN=S0
-  local i1 i2 i3 i4 r_x r_y c77 c78 o1
+  local i1 i2 i3 i4 r_x r_y c77 c78 o1 p1 rec1 out
   i1=$(q "SELECT id FROM wp_book_items WHERE external_item_id = 'BASE-01'")
   i2=$(q "SELECT id FROM wp_book_items WHERE external_item_id = 'BASE-02'")
   i3=$(q "SELECT id FROM wp_book_items WHERE external_item_id = 'BASE-03'")
   i4=$(q "SELECT id FROM wp_book_items WHERE external_item_id = 'BASE-04'")
+  rec1=$(q "SELECT book_record_id FROM wp_book_items WHERE id = $i1")
   local NOW='UTC_TIMESTAMP(6)' HOUR='UTC_TIMESTAMP(6) + INTERVAL 1 HOUR'
   local RES='INSERT INTO wp_book_reservations (book_item_id, user_id, reservation_status, attempt_no, reserved_at, expires_at, released_at, order_id)'
 
   echo "--- экземпляры"
-  expect_err S0.01 "sold без sold_at невозможен (ck_items_sold_at)" 3819 ck_items_sold_at \
+  expect_err S0.01 "sold без sold_at невозможен" 3819 wp_book_items_chk_sold_at \
     "UPDATE wp_book_items SET availability_status = 'sold' WHERE id = $i1"
-  expect_err S0.02 "неизвестный статус экземпляра (ck_items_status)" 3819 ck_items_status \
+  expect_err S0.02 "неизвестный статус экземпляра" 3819 wp_book_items_chk_status \
     "UPDATE wp_book_items SET availability_status = 'lost' WHERE id = $i1"
-  expect_err S0.03 "внешний book_id = один экземпляр (uq_items_external)" 1062 uq_items_external \
-    "INSERT INTO wp_book_items (book_record_id, source_name, external_item_id, price_amount)
-     SELECT book_record_id, source_name, external_item_id, 100 FROM wp_book_items WHERE id = $i1"
-  xcheck S0.04 "валюта только A–Z (ck_items_currency): 'eur' должна отклоняться" \
-    "$(q "UPDATE wp_book_items SET currency = 'eur' WHERE id = $i1; SELECT currency FROM wp_book_items WHERE id = $i1;" 2>&1 | tail -n1)" \
-    "ERROR 3819" \
-    "колонка CHARACTER SET ascii (ascii_general_ci) — REGEXP '^[A-Z]{3}\$' регистронезависим; нужно REGEXP_LIKE(currency, '^[A-Z]{3}\$', 'c') или COLLATE ascii_bin"
-  q "UPDATE wp_book_items SET currency = 'EUR' WHERE id = $i1"
+  expect_err S0.03 "внешний book_id = один экземпляр" 1062 uq_items_external \
+    "INSERT INTO wp_book_items (book_record_id, source_name, external_item_id, price_amount, currency)
+     SELECT book_record_id, source_name, external_item_id, 100, 'RUB' FROM wp_book_items WHERE id = $i1"
+  expect_err S0.04 "валюта только A–Z: 'rub' отклоняется (utf8mb4_bin — REGEXP регистрозависим)" 3819 wp_book_items_chk_currency \
+    "UPDATE wp_book_items SET currency = 'rub' WHERE id = $i1"
 
   echo "--- резервы"
   q "$RES VALUES ($i2, 1, 'active', 1, $NOW, $HOUR, NULL, NULL)"
-  expect_err S0.05 "второй active-резерв на экземпляр (uq_reservations_one_active_per_item)" 1062 uq_reservations_one_active_per_item \
+  expect_err S0.05 "второй active-резерв на экземпляр" 1062 uq_reservations_one_active_per_item \
     "$RES VALUES ($i2, 2, 'active', 1, $NOW, $HOUR, NULL, NULL)"
   checkq S0.06 "неактивных резервов на экземпляр — сколько угодно (generated column = NULL)" \
     "$RES VALUES ($i2, 3, 'expired', 1, $NOW, $HOUR, $NOW, NULL), ($i2, 4, 'cancelled', 1, $NOW, $HOUR, $NOW, NULL);
      SELECT CONCAT(COUNT(*), ' строк, active_book_item_id IS NULL: ', SUM(active_book_item_id IS NULL))
        FROM wp_book_reservations WHERE book_item_id = $i2 AND reservation_status <> 'active'" \
     "2 строк, active_book_item_id IS NULL: 2"
-  expect_err S0.07 "4-я попытка (ck_reservations_attempt_range)" 3819 ck_reservations_attempt_range \
+  expect_err S0.07 "4-я попытка" 3819 wp_book_reservations_chk_attempt_range \
     "$RES VALUES ($i2, 3, 'expired', 4, $NOW, $HOUR, $NOW, NULL)"
-  expect_err S0.08 "повтор номера попытки (uq_reservations_attempt)" 1062 uq_reservations_attempt \
+  expect_err S0.08 "повтор номера попытки" 1062 uq_reservations_attempt \
     "$RES VALUES ($i2, 3, 'cancelled', 1, $NOW, $HOUR, $NOW, NULL)"
-  expect_err S0.09 "released_by_admin обязан иметь attempt_no = NULL (ck_reservations_attempt_admin)" 3819 ck_reservations_attempt_admin \
+  expect_err S0.09 "released_by_admin обязан иметь attempt_no = NULL" 3819 wp_book_reservations_chk_attempt_admin \
     "$RES VALUES ($i3, 5, 'released_by_admin', 2, $NOW, $HOUR, $NOW, NULL)"
-  expect_err S0.10 "не-admin резерв обязан иметь номер попытки (ck_reservations_attempt_admin)" 3819 ck_reservations_attempt_admin \
+  expect_err S0.10 "не-admin резерв обязан иметь номер попытки" 3819 wp_book_reservations_chk_attempt_admin \
     "$RES VALUES ($i3, 5, 'active', NULL, $NOW, $HOUR, NULL, NULL)"
-  expect_err S0.11 "active ⇔ released_at IS NULL (ck_reservations_released)" 3819 ck_reservations_released \
+  expect_err S0.11 "active ⇔ released_at IS NULL" 3819 wp_book_reservations_chk_released \
     "$RES VALUES ($i3, 5, 'active', 1, $NOW, $HOUR, $NOW, NULL)"
-  expect_err S0.12 "converted_to_order без order_id (ck_reservations_order)" 3819 ck_reservations_order \
+  expect_err S0.12 "converted_to_order без order_id" 3819 wp_book_reservations_chk_order \
     "$RES VALUES ($i3, 5, 'converted_to_order', 1, $NOW, $HOUR, $NOW, NULL)"
-  expect_err S0.13 "резерв несуществующего экземпляра (fk_reservations_item)" 1452 fk_reservations_item \
+  expect_err S0.13 "резерв несуществующего экземпляра" 1452 wp_book_reservations_fk_item \
     "$RES VALUES (999999, 5, 'active', 1, $NOW, $HOUR, NULL, NULL)"
   q "UPDATE wp_book_reservations SET reservation_status = 'cancelled', released_at = $NOW, release_reason = 'test_cleanup'
       WHERE book_item_id = $i2 AND reservation_status = 'active'"
 
   echo "--- корзины"
   q "INSERT INTO wp_book_carts (user_id, status, started_at, last_activity_at) VALUES (77, 'active', $NOW, $NOW)"
-  expect_err S0.14 "вторая открытая корзина пользователя (uq_carts_one_open_per_user)" 1062 uq_carts_one_open_per_user \
+  expect_err S0.14 "вторая открытая корзина пользователя" 1062 uq_carts_one_open_per_user \
     "INSERT INTO wp_book_carts (user_id, status, started_at, last_activity_at) VALUES (77, 'checkout_started', $NOW, $NOW)"
   checkq S0.15 "закрытых корзин у пользователя — сколько угодно" \
     "INSERT INTO wp_book_carts (user_id, status, started_at, last_activity_at, closed_at)
@@ -256,37 +243,112 @@ s0() {
   c78=$(q "SELECT id FROM wp_book_carts WHERE open_cart_user_id = 78")
   r_x=$(q "SELECT id FROM wp_book_reservations WHERE book_item_id = $i2 AND user_id = 3")
   r_y=$(q "SELECT id FROM wp_book_reservations WHERE book_item_id = $i2 AND user_id = 4")
-  q "INSERT INTO wp_book_cart_items (cart_id, book_item_id, reservation_id, unit_price_amount, currency, status, added_at, expires_at)
-     VALUES ($c77, $i4, $r_x, 2500, 'EUR', 'active', $NOW, $HOUR)"
-  expect_err S0.16 "книга — активная позиция только одной корзины (uq_cart_items_one_active_per_item)" 1062 uq_cart_items_one_active_per_item \
-    "INSERT INTO wp_book_cart_items (cart_id, book_item_id, reservation_id, unit_price_amount, currency, status, added_at, expires_at)
-     VALUES ($c78, $i4, $r_y, 2500, 'EUR', 'active', $NOW, $HOUR)"
-  expect_err S0.17 "одна позиция на резерв (uq_cart_items_reservation)" 1062 uq_cart_items_reservation \
-    "INSERT INTO wp_book_cart_items (cart_id, book_item_id, reservation_id, unit_price_amount, currency, status, added_at, expires_at, closed_at)
-     VALUES ($c78, $i4, $r_x, 2500, 'EUR', 'removed', $NOW, $HOUR, $NOW)"
+  local CI='INSERT INTO wp_book_cart_items (cart_id, book_item_id, reservation_id, unit_price_amount, currency, status, added_at, expires_at'
+  q "$CI) VALUES ($c77, $i4, $r_x, 2500, 'RUB', 'active', $NOW, $HOUR)"
+  expect_err S0.16 "книга — активная позиция только одной корзины" 1062 uq_cart_items_one_active_per_item \
+    "$CI) VALUES ($c78, $i4, $r_y, 2500, 'RUB', 'active', $NOW, $HOUR)"
+  expect_err S0.17 "одна позиция на резерв" 1062 uq_cart_items_reservation \
+    "$CI, closed_at) VALUES ($c78, $i4, $r_x, 2500, 'RUB', 'removed', $NOW, $HOUR, $NOW)"
   q "UPDATE wp_book_cart_items SET status = 'removed', closed_at = $NOW WHERE cart_id = $c77"
 
   echo "--- заказы, платежи, события"
   local ORD='INSERT INTO wp_book_orders (public_order_id, user_id, checkout_request_id, status, currency, subtotal_amount, total_amount, customer_email, customer_first_name, customer_last_name, paid_at)'
-  expect_err S0.18 "public_order_id только uniundata_<uuid v4> (ck_orders_public_id)" 3819 ck_orders_public_id \
-    "$ORD VALUES ('uniundata_12345', 77, NULL, 'cancelled', 'EUR', 0, 0, 'a@example.test', 'A', 'B', NULL)"
-  expect_err S0.19 "total = subtotal − discount + shipping (ck_orders_total)" 3819 ck_orders_total \
-    "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, NULL, 'cancelled', 'EUR', 0, 100, 'a@example.test', 'A', 'B', NULL)"
-  expect_err S0.20 "paid без paid_at (ck_orders_paid_at)" 3819 ck_orders_paid_at \
-    "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, NULL, 'paid', 'EUR', 0, 0, 'a@example.test', 'A', 'B', NULL)"
-  q "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, 'f00dfeed-0000-4000-8000-000000000001', 'cancelled', 'EUR', 0, 0, 'a@example.test', 'A', 'B', NULL)"
-  expect_err S0.21 "один заказ на Idempotency-Key пользователя (uq_orders_checkout_request)" 1062 uq_orders_checkout_request \
-    "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, 'f00dfeed-0000-4000-8000-000000000001', 'cancelled', 'EUR', 0, 0, 'a@example.test', 'A', 'B', NULL)"
+  expect_err S0.18 "public_order_id только uniundata_<uuid v4>" 3819 wp_book_orders_chk_public_id \
+    "$ORD VALUES ('uniundata_12345', 77, NULL, 'cancelled', 'RUB', 1000, 1000, 'a@example.test', 'A', 'B', NULL)"
+  expect_err S0.19 "total = subtotal − discount + shipping" 3819 wp_book_orders_chk_total \
+    "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, NULL, 'cancelled', 'RUB', 1000, 1100, 'a@example.test', 'A', 'B', NULL)"
+  expect_err S0.20 "paid без paid_at" 3819 wp_book_orders_chk_paid_at \
+    "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, NULL, 'paid', 'RUB', 1000, 1000, 'a@example.test', 'A', 'B', NULL)"
+  q "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, 'f00dfeed-0000-4000-8000-000000000001', 'cancelled', 'RUB', 1000, 1000, 'a@example.test', 'A', 'B', NULL)"
+  expect_err S0.21 "один заказ на Idempotency-Key пользователя" 1062 uq_orders_checkout_request \
+    "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, 'f00dfeed-0000-4000-8000-000000000001', 'cancelled', 'RUB', 1000, 1000, 'a@example.test', 'A', 'B', NULL)"
   o1=$(q "SELECT id FROM wp_book_orders WHERE user_id = 77 LIMIT 1")
-  expect_err S0.22 "в платеже только 4 последние цифры карты (ck_payments_last4)" 3819 ck_payments_last4 \
-    "INSERT INTO wp_book_payments (order_id, provider, attempt_no, idempotency_key, status, amount, currency, card_last4)
-     VALUES ($o1, 'testbank', 1, f_uuid4(), 'created', 0, 'EUR', '42x2')"
+  local PAY='INSERT INTO wp_book_payments (order_id, provider, attempt_no, idempotency_key, status, amount, refunded_amount, currency, card_last4)'
+  expect_err S0.22 "в платеже только 4 последние цифры карты" 3819 wp_book_payments_chk_last4 \
+    "$PAY VALUES ($o1, 'testbank', 1, f_uuid4(), 'created', 1000, 0, 'RUB', '42x2')"
   q "INSERT INTO wp_book_payment_events (provider, provider_event_id, event_type, payload_redacted, payload_sha256, received_at)
      VALUES ('testbank', 'S0-evt', 'payment.succeeded', '{}', REPEAT('0', 64), $NOW)"
-  expect_err S0.23 "одно событие банка — одна строка inbox (uq_payment_events_provider)" 1062 uq_payment_events_provider \
+  expect_err S0.23 "одно событие банка — одна строка inbox" 1062 uq_payment_events_provider \
     "INSERT INTO wp_book_payment_events (provider, provider_event_id, event_type, payload_redacted, payload_sha256, received_at)
      VALUES ('testbank', 'S0-evt', 'payment.succeeded', '{}', REPEAT('0', 64), $NOW)"
 
+  echo "--- v2: суммы строго > 0 (бесплатная книга / нулевой платёж — ошибка данных)"
+  expect_err S0.24 "цена экземпляра 0" 3819 wp_book_items_chk_price \
+    "UPDATE wp_book_items SET price_amount = 0 WHERE id = $i1"
+  expect_err S0.25 "снимок цены в корзине 0" 3819 wp_book_cart_items_chk_price \
+    "UPDATE wp_book_cart_items SET unit_price_amount = 0 WHERE cart_id = $c77"
+  expect_err S0.26 "заказ на 0" 3819 wp_book_orders_chk_positive \
+    "$ORD VALUES (CONCAT('uniundata_', f_uuid4()), 77, NULL, 'cancelled', 'RUB', 0, 0, 'a@example.test', 'A', 'B', NULL)"
+  expect_err S0.27 "снимок цены в заказе 0" 3819 wp_book_order_items_chk_price \
+    "INSERT INTO wp_book_order_items (order_id, book_item_id, book_record_id, title_snapshot, item_identifier_snapshot, unit_price_amount, currency)
+     VALUES ($o1, $i1, $rec1, 'T', 'BASE-01', 0, 'RUB')"
+  expect_err S0.28 "платёж на 0" 3819 wp_book_payments_chk_amount \
+    "$PAY VALUES ($o1, 'testbank', 1, f_uuid4(), 'created', 0, 0, 'RUB', NULL)"
+  q "$PAY VALUES ($o1, 'testbank', 1, 'f00dfeed-0000-4000-8000-0000000000a1', 'created', 1000, 0, 'RUB', NULL)"
+  p1=$(q "SELECT id FROM wp_book_payments WHERE order_id = $o1")
+  expect_err S0.29 "возвращено больше, чем заплачено (refunded_amount ≤ amount)" 3819 wp_book_payments_chk_amount \
+    "UPDATE wp_book_payments SET refunded_amount = 1001 WHERE id = $p1"
+  local REF='INSERT INTO wp_book_refunds (payment_id, order_id, amount, currency, reason, idempotency_key, status, requested_at)'
+  expect_err S0.30 "возврат на 0" 3819 wp_book_refunds_chk_amount \
+    "$REF VALUES ($p1, $o1, 0, 'RUB', 'manual', f_uuid4(), 'requested', $NOW)"
+  q "INSERT INTO wp_book_order_items (order_id, book_item_id, book_record_id, title_snapshot, item_identifier_snapshot, unit_price_amount, currency)
+     VALUES ($o1, $i1, $rec1, 'T', 'BASE-01', 1000, 'RUB')"
+  expect_err S0.31 "продажа за 0" 3819 wp_book_sales_chk_price \
+    "INSERT INTO wp_book_sales (book_item_id, book_record_id, order_id, order_item_id, payment_id, user_id, sold_at, price_amount, currency)
+     SELECT $i1, $rec1, $o1, id, $p1, 77, $NOW, 0, 'RUB' FROM wp_book_order_items WHERE order_id = $o1"
+
+  echo "--- v2: возвраты — один ключ идемпотентности банка на одну строку"
+  q "$REF VALUES ($p1, $o1, 500, 'RUB', 'manual', 'f00dfeed-0000-4000-8000-0000000000b1', 'requested', $NOW)"
+  expect_err S0.32 "повтор idempotency_key возврата" 1062 uq_refunds_idempotency \
+    "$REF VALUES ($p1, $o1, 300, 'RUB', 'manual', 'f00dfeed-0000-4000-8000-0000000000b1', 'requested', $NOW)"
+  expect_err S0.33 "неизвестная причина возврата" 3819 wp_book_refunds_chk_reason \
+    "$REF VALUES ($p1, $o1, 300, 'RUB', 'goodwill', f_uuid4(), 'requested', $NOW)"
+  expect_err S0.34 "succeeded без completed_at" 3819 wp_book_refunds_chk_completed \
+    "UPDATE wp_book_refunds SET status = 'succeeded' WHERE payment_id = $p1"
+
+  echo "--- v2: внешние ID регистрозависимы (utf8mb4_bin)"
+  checkq S0.35 "'base-01' и 'BASE-01' — два разных экземпляра; поиск по 'base-01' находит только свой" \
+    "INSERT INTO wp_book_items (book_record_id, source_name, external_item_id, price_amount, currency)
+     SELECT book_record_id, 'primary', 'base-01', 1000, 'RUB' FROM wp_book_items WHERE id = $i1;
+     SELECT CONCAT(COUNT(*), ' / ', GROUP_CONCAT(external_item_id)) FROM wp_book_items WHERE external_item_id = 'base-01'" "1 / base-01"
+  expect_err S0.36 "хвостовой пробел не различается (utf8mb4_bin — PAD SPACE): SourceBatch пропускает только \\x21–\\x7E" 1062 uq_items_external \
+    "INSERT INTO wp_book_items (book_record_id, source_name, external_item_id, price_amount, currency)
+     SELECT book_record_id, 'primary', 'BASE-01 ', 1000, 'RUB' FROM wp_book_items WHERE id = $i1"
+  q "UPDATE wp_book_items SET is_active = 0 WHERE external_item_id = 'base-01'"
+
+  echo "--- v2: FULLTEXT построен без стоп-слов (SET SESSION innodb_ft_enable_stopword = OFF перед CREATE TABLE)"
+  q "INSERT INTO wp_book_records (source_name, source_record_id, source_format, marc21_format, marc21_raw, source_checksum, title, title_sort, authors_text, is_active)
+     VALUES ('primary', 'S0-FT-1', 'marcxml', 'marcxml', '<r/>', REPEAT('a', 64), 'Krieg und Frieden', 'krieg und frieden', 'Lew Tolstoi', 0),
+            ('primary', 'S0-FT-2', 'marcxml', 'marcxml', '<r/>', REPEAT('b', 64), 'Ум и сердце', 'ум и сердце', 'Иванов', 0)"
+  local FT="SELECT COUNT(*) FROM wp_book_records WHERE MATCH(title, subtitle, authors_text, series_title) AGAINST"
+  checkq S0.37 "'+Krieg +und +Frieden' и '+und' находят запись (ft_records_main)" \
+    "SELECT CONCAT(($FT('+Krieg +und +Frieden' IN BOOLEAN MODE)), '/', ($FT('+und' IN BOOLEAN MODE)))" "1/1"
+  checkq S0.38 "контроль: та же таблица со стоп-словами InnoDB по умолчанию — '+Krieg +und' даёт 0" \
+    "SET SESSION innodb_ft_enable_stopword = ON;
+     CREATE TABLE t_ft_ctl (id INT PRIMARY KEY AUTO_INCREMENT, title VARCHAR(200), FULLTEXT KEY ft (title)) ENGINE=InnoDB;
+     INSERT INTO t_ft_ctl (title) VALUES ('Krieg und Frieden');
+     SELECT COUNT(*) FROM t_ft_ctl WHERE MATCH(title) AGAINST('+Krieg +und' IN BOOLEAN MODE); DROP TABLE t_ft_ctl" "0"
+  checkq S0.39 "слова короче innodb_ft_min_token_size (3) не индексируются: '+ум' → 0, '+сердце' → 1 (поэтому плагин не делает их обязательными)" \
+    "SELECT CONCAT(($FT('+ум' IN BOOLEAN MODE)), '/', ($FT('+сердце' IN BOOLEAN MODE)))" "0/1"
+
+  echo "--- v2: вторая установка WordPress в той же БД (префикс wp_2_): sed 's/\\bwp_/wp_2_/g' schema.sql"
+  out=$(sed 's/\bwp_/wp_2_/g' "$SCHEMA" | "${MYSQL[@]}" "$DB" 2>&1)
+  check S0.40 "схема с префиксом wp_2_ загружается рядом с wp_ без ошибок" \
+    "${out:-ok} / $(q "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME LIKE 'wp\\_2\\_book\\_%'") таблиц" "ok / 21 таблиц"
+  checkq S0.41 "каждое имя CHECK/FK начинается с имени своей таблицы (обе установки: 86 + 86, чужих имён 0)" \
+    "SELECT CONCAT(SUM(TABLE_NAME LIKE 'wp\\_2\\_%'), ' + ', SUM(TABLE_NAME NOT LIKE 'wp\\_2\\_%'), ', чужих ', SUM(CONSTRAINT_NAME NOT LIKE CONCAT(TABLE_NAME, '\\_%')))
+       FROM information_schema.TABLE_CONSTRAINTS
+      WHERE TABLE_SCHEMA = DATABASE() AND CONSTRAINT_TYPE IN ('CHECK', 'FOREIGN KEY') AND TABLE_NAME LIKE 'wp%book%'" "86 + 86, чужих 0"
+  expect_err S0.42 "ошибка второй установки называет её ограничение (Db сверяет по суффиксу _chk_status)" 3819 wp_2_book_items_chk_status \
+    "INSERT INTO wp_2_book_records (source_name, source_record_id, source_format, marc21_format, marc21_raw, source_checksum, title, title_sort)
+     VALUES ('primary', 'S0-P2', 'marcxml', 'marcxml', '<r/>', REPEAT('c', 64), 'P2', 'p2');
+     INSERT INTO wp_2_book_items (book_record_id, external_item_id, price_amount, currency, availability_status)
+     VALUES (LAST_INSERT_ID(), 'BASE-01', 1000, 'RUB', 'lost')"
+  expect_err S0.43 "контроль: одно имя CHECK в двух таблицах — ERROR 3822 (поэтому имя = <таблица>_chk_<x>)" 3822 t_same_chk \
+    "CREATE TABLE t_chk_a (a INT, CONSTRAINT t_same_chk CHECK (a > 0)); CREATE TABLE t_chk_b (a INT, CONSTRAINT t_same_chk CHECK (a > 0))"
+  q "DROP TABLE IF EXISTS t_chk_a, t_chk_b"
+  checkq S0.44 "Db::lockName() разных установок различается: GET_LOCK синхронизации не пересекаются" \
+    "SELECT CONCAT(f_lock_name('sync_primary', 'wp_') <> f_lock_name('sync_primary', 'wp_2_'), ' ', f_lock_name('sync_primary', 'wp_') REGEXP '^uniundata_sync_primary@[0-9a-f]{12}\$')" "1 1"
 }
 
 # ======================================================================================
@@ -422,7 +484,7 @@ s2() {
   sub S2.3 "checkout после истечения часа, но раньше cron: позиция истекает в самом checkout"
   it=$(mk_item S2-3 3200)
   setup "CALL a_reserve(1204, $it);"
-  run U1 "CALL a_checkout(1204, '$(uuid)', 3200, 'EUR');" 61
+  run U1 "CALL a_checkout(1204, '$(uuid)', 3200, 'RUB');" 61
   timeline
   check S2.3a "409 uniundata_cart_changed (positions_expired)" "$(oc U1 checkout) $(oj U1 checkout '$.reason')" "409 uniundata_cart_changed positions_expired"
   checkq S2.3b "заказ не создан, резерв expired (checkout_expired), экземпляр available" \
@@ -441,6 +503,48 @@ s2() {
   check S2.4b "после COMMIT cron U2 получил резерв" "$(oc U2 reserve)" "201 created"
   checkq S2.4c "старый резерв expired, новый active у U2" \
     "SELECT GROUP_CONCAT(CONCAT(user_id, ':', reservation_status) ORDER BY id) FROM wp_book_reservations WHERE book_item_id = $it" "1205:expired,1206:active"
+
+  sub S2.5 "платёж created: банк отказал в сессии → cancelled; PHP-процесс умер после Tx1 → pass B: created → expired"
+  sweep
+  local b o2
+  it=$(mk_item S2-5A 3400); b=$(mk_item S2-5B 3500)
+  setup "CALL a_reserve(1207, $it); CALL a_reserve(1208, $b);"
+  run U1 "SET @bank_session = 'error'; CALL a_checkout(1207, '$(uuid)', 3400, 'RUB');"
+  run U2 "SET @bank_session = 'crash'; CALL a_checkout(1208, '$(uuid)', 3500, 'RUB');"
+  o=$(q "SELECT id FROM wp_book_orders WHERE user_id = 1207"); o2=$(q "SELECT id FROM wp_book_orders WHERE user_id = 1208")
+  check S2.5a "createSession упал → 502 uniundata_payment_provider_error" "$(oc U1 checkout)" "502 uniundata_payment_provider_error"
+  checkq S2.5b "платёж created → cancelled (session_create_failed), заказ payment_failed, экземпляр за заказом до payment_due_at" \
+    "SELECT CONCAT(p.status, ':', p.failure_code, '/', o.status, '/', i.availability_status)
+       FROM wp_book_payments p JOIN wp_book_orders o ON o.id = p.order_id JOIN wp_book_items i ON i.id = $it WHERE o.id = $o" \
+    "cancelled:session_create_failed/payment_failed/checkout_pending"
+  check S2.5c "процесс умер между Tx1 и Tx2: заказ draft, платёж created, экземпляр checkout_pending" \
+    "$(ost "$o2")/$(q "SELECT status FROM wp_book_payments WHERE order_id = $o2")/$(st "$b")" "draft/created/checkout_pending"
+  run CRON "CALL a_expire_orders('none');" 41
+  timeline
+  checkq S2.5d "pass B (+41 мин, банк платежа не знает): draft → payment_expired, платёж created → expired, экземпляр available" \
+    "SELECT CONCAT(o.status, '/', p.status, ':', p.failure_code, '/', (SELECT availability_status FROM wp_book_items WHERE id = $b))
+       FROM wp_book_orders o JOIN wp_book_payments p ON p.order_id = o.id WHERE o.id = $o2" "payment_expired/expired:order_expired/available"
+  checkq S2.5e "заказ payment_failed тоже закрыт; cancelled-платёж не тронут" \
+    "SELECT CONCAT(o.status, '/', p.status, '/', (SELECT availability_status FROM wp_book_items WHERE id = $it))
+       FROM wp_book_orders o JOIN wp_book_payments p ON p.order_id = o.id WHERE o.id = $o" "payment_expired/cancelled/available"
+
+  sub S2.6 "банк отвечает processing: pass B продлевает срок ОДИН раз (orders.payment_due_extended_at)"
+  it=$(mk_item S2-6 3600); o=$(mk_order 1209 "$it")
+  run_bg C1 "SET @pause_at = 'oexp.before_commit'; CALL a_expire_order_one($o, 'processing');" 41
+  run_bg C2 "CALL t_wait_paused('C1', 'oexp.before_commit'); CALL a_expire_order_one($o, 'processing');" 41
+  waitall; timeline
+  check S2.6a "два раннера одновременно: C1 продлил, C2 ждал блокировку и увидел новый срок — noop" \
+    "$(oc C1 expire_order) / $(oc C2 expire_order) $(oj C2 expire_order '$.is_due')" "200 extended / 200 noop 0"
+  checkq S2.6b "payment_due_at = момент продления + grace (10 мин); заказ payment_processing; флаг payment_processing_overdue; платёж processing" \
+    "SELECT CONCAT(TIMESTAMPDIFF(MINUTE, payment_due_extended_at, payment_due_at), ' мин/', status, '/', attention_reason, '/',
+                   (SELECT status FROM wp_book_payments WHERE order_id = $o)) FROM wp_book_orders WHERE id = $o" \
+    "10 мин/payment_processing/payment_processing_overdue/processing"
+  run C3 "CALL a_expire_order_one($o, 'processing');" 52
+  check S2.6c "+52 мин, банк всё ещё processing: второго продления нет — заказ payment_expired" "$(oc C3 expire_order)/$(ost "$o")" "200 payment_expired/payment_expired"
+  checkq S2.6d "платёж processing → expired, экземпляр available, продление в аудите ровно 1 раз" \
+    "SELECT CONCAT((SELECT status FROM wp_book_payments WHERE order_id = $o), '/', (SELECT availability_status FROM wp_book_items WHERE id = $it), '/',
+                   (SELECT COUNT(*) FROM wp_book_audit_log WHERE entity_type = 'order' AND entity_id = $o AND action = 'order.payment_due_extended'))" \
+    "expired/available/1"
 }
 
 # ======================================================================================
@@ -489,6 +593,30 @@ s3() {
   checkq S3.3e "история попыток" \
     "SELECT GROUP_CONCAT(CONCAT(COALESCE(attempt_no, 'NULL'), ':', reservation_status) ORDER BY id) FROM wp_book_reservations WHERE user_id = 1303" \
     "1:cancelled,2:cancelled,NULL:released_by_admin,3:cancelled"
+
+  sub S3.4 "лимит одновременно отложенных книг (uniundata_max_active_reservations = 10): COUNT под блокировкой корзины"
+  local items=() k
+  for k in $(seq 1 11); do items+=("$(mk_item "S3-4-$k" 1000)"); done
+  for k in $(seq 0 8); do setup "CALL a_reserve(1304, ${items[$k]});"; done
+  run_bg T1 "SET @pause_at = 'reserve.before_commit'; CALL a_reserve(1304, ${items[9]});"
+  run_bg T2 "CALL t_wait_paused('T1', 'reserve.before_commit'); CALL a_reserve(1304, ${items[10]});"
+  waitall; timeline
+  check S3.4a "9 книг уже отложено; 10-я (вкладка 1) — 201" "$(oc T1 reserve)" "201 created"
+  check S3.4b "11-я (вкладка 2) ждала корзину пользователя" "$(traced T1 '%T2 ждёт X,REC_NOT_GAP wp_book_carts.%')" "1"
+  check S3.4c "и после COMMIT вкладки 1 получила 409 uniundata_active_reservation_limit" \
+    "$(oc T2 reserve) max=$(oj T2 reserve '$.max_active_reservations')" "409 uniundata_active_reservation_limit max=10"
+  run U1 "CALL a_remove(1304, ${items[0]}); CALL a_reserve(1304, ${items[10]});"
+  check S3.4d "удалил одну книгу — 11-я резервируется" "$(oc U1 reserve)" "201 created"
+
+  sub S3.5 "экземпляр не в валюте магазина (option uniundata_currency = RUB) не резервируется"
+  it=$(mk_item S3-5 4200)
+  q "UPDATE wp_book_items SET currency = 'EUR' WHERE id = $it"
+  run U1 "CALL a_reserve(1305, $it);"
+  check S3.5a "409 uniundata_item_unavailable, data.reason = currency" \
+    "$(oc U1 reserve) $(oj U1 reserve '$.reason') $(oj U1 reserve '$.currency')≠$(oj U1 reserve '$.shop_currency')" "409 uniundata_item_unavailable currency EUR≠RUB"
+  checkq S3.5b "откат целиком: попытка не потрачена, корзина не создана, экземпляр available" \
+    "SELECT CONCAT((SELECT COUNT(*) FROM wp_book_reservations WHERE user_id = 1305), '/', (SELECT COUNT(*) FROM wp_book_carts WHERE user_id = 1305), '/',
+                   (SELECT availability_status FROM wp_book_items WHERE id = $it))" "0/0/available"
 }
 
 # ======================================================================================
@@ -521,7 +649,7 @@ s4() {
   a=$(mk_item S4-2A 5200); b=$(mk_item S4-2B 5300)
   setup "CALL a_reserve(1402, $a); CALL a_reserve(1402, $b);"
   run_bg R "SET @pause_at = 'remove.before_commit'; CALL a_remove(1402, $a);"
-  run_bg CO "CALL t_wait_paused('R', 'remove.before_commit'); CALL a_checkout(1402, '$(uuid)', 10500, 'EUR');"
+  run_bg CO "CALL t_wait_paused('R', 'remove.before_commit'); CALL a_checkout(1402, '$(uuid)', 10500, 'RUB');"
   waitall; timeline
   check S4.2a "remove — 200" "$(oc R remove)" "200 removed"
   check S4.2b "checkout ждал корзину и ответил 409 cart_changed (total_mismatch: 5300 вместо 10500)" \
@@ -532,7 +660,7 @@ s4() {
   sub S4.3 "гонка remove ↔ checkout: checkout первым → remove получает 409 (книга уже в заказе)"
   a=$(mk_item S4-3A 5400); b=$(mk_item S4-3B 5500)
   setup "CALL a_reserve(1403, $a); CALL a_reserve(1403, $b);"
-  run_bg CO "SET @pause_at = 'checkout.before_commit'; CALL a_checkout(1403, '$(uuid)', 10900, 'EUR');"
+  run_bg CO "SET @pause_at = 'checkout.before_commit'; CALL a_checkout(1403, '$(uuid)', 10900, 'RUB');"
   run_bg R "CALL t_wait_paused('CO', 'checkout.before_commit'); CALL a_remove(1403, $a);"
   waitall; timeline
   check S4.3a "checkout — 201" "$(oc CO checkout)" "201 created"
@@ -549,9 +677,9 @@ s5() {
 
   sub S5.1 "повтор того же события ПОСЛЕ обработки: inbox отвечает duplicate, ничего не меняется"
   it=$(mk_item S5-1 6000); o=$(mk_order 1501 "$it"); pp=$(pp_of "$o")
-  run WH1 "CALL a_webhook('S5-1-evt', '$pp', 'succeeded', 6000, 'EUR', NULL);"
+  run WH1 "CALL a_webhook('S5-1-evt', '$pp', 'succeeded', 6000, 'RUB', NULL);"
   upd1=$(q "SELECT CONCAT(updated_at, '|', (SELECT updated_at FROM wp_book_items WHERE id = $it)) FROM wp_book_orders WHERE id = $o")
-  run WH2 "CALL a_webhook('S5-1-evt', '$pp', 'succeeded', 6000, 'EUR', NULL);"
+  run WH2 "CALL a_webhook('S5-1-evt', '$pp', 'succeeded', 6000, 'RUB', NULL);"
   upd2=$(q "SELECT CONCAT(updated_at, '|', (SELECT updated_at FROM wp_book_items WHERE id = $it)) FROM wp_book_orders WHERE id = $o")
   timeline
   check S5.1a "первый — processed, второй — duplicate (inbox)" "$(oc WH1 webhook) / $(oc WH2 webhook) $(oj WH2 webhook '$.where')" "200 processed / 200 duplicate inbox"
@@ -567,8 +695,8 @@ s5() {
 
   sub S5.2 "то же событие ОДНОВРЕМЕННО двумя сессиями: второй ждёт блокировку и видит processed"
   it=$(mk_item S5-2 6100); o=$(mk_order 1502 "$it"); pp=$(pp_of "$o")
-  run_bg WH1 "SET @pause_at = 'apply.after_items'; CALL a_webhook('S5-2-evt', '$pp', 'succeeded', 6100, 'EUR', NULL);"
-  run_bg WH2 "CALL t_wait_paused('WH1', 'apply.after_items'); CALL a_webhook('S5-2-evt', '$pp', 'succeeded', 6100, 'EUR', NULL);"
+  run_bg WH1 "SET @pause_at = 'apply.after_items'; CALL a_webhook('S5-2-evt', '$pp', 'succeeded', 6100, 'RUB', NULL);"
+  run_bg WH2 "CALL t_wait_paused('WH1', 'apply.after_items'); CALL a_webhook('S5-2-evt', '$pp', 'succeeded', 6100, 'RUB', NULL);"
   waitall; timeline
   check S5.2a "оба прошли inbox (received), WH2 ждал X-lock экземпляра" "$(traced WH1 '%WH2 ждёт X,REC_NOT_GAP wp_book_items.PRIMARY%')" "1"
   check S5.2b "WH1 processed, WH2 duplicate (обнаружен под блокировкой события)" "$(oc WH1 webhook) / $(oc WH2 webhook) $(oj WH2 webhook '$.where')" "200 processed / 200 duplicate under_lock"
@@ -579,8 +707,8 @@ s5() {
 
   sub S5.3 "банк прислал ДВА РАЗНЫХ события об одном успехе одновременно"
   it=$(mk_item S5-3 6200); o=$(mk_order 1503 "$it"); pp=$(pp_of "$o")
-  run_bg WH1 "SET @pause_at = 'apply.before_commit'; CALL a_webhook('S5-3-evt-A', '$pp', 'succeeded', 6200, 'EUR', NULL);"
-  run_bg WH2 "CALL t_wait_paused('WH1', 'apply.before_commit'); CALL a_webhook('S5-3-evt-B', '$pp', 'succeeded', 6200, 'EUR', NULL);"
+  run_bg WH1 "SET @pause_at = 'apply.before_commit'; CALL a_webhook('S5-3-evt-A', '$pp', 'succeeded', 6200, 'RUB', NULL);"
+  run_bg WH2 "CALL t_wait_paused('WH1', 'apply.before_commit'); CALL a_webhook('S5-3-evt-B', '$pp', 'succeeded', 6200, 'RUB', NULL);"
   waitall; timeline
   check S5.3a "A processed; B — ignored (already_succeeded)" "$(oc WH1 webhook) / $(oc WH2 webhook) $(oj WH2 webhook '$.note')" "200 processed / 200 ignored already_succeeded"
   checkq S5.3b "одна продажа; события: A processed, B ignored" \
@@ -605,13 +733,18 @@ s5() {
   it=$(mk_item S5-5 6400); o=$(mk_order 1505 "$it"); pp=$(pp_of "$o")
   # Вторая платёжная попытка, как её создал бы POST /orders/{id}/pay до прихода первого webhook
   setup "INSERT INTO wp_book_payments (order_id, provider, attempt_no, idempotency_key, provider_payment_id, status, amount, currency)
-         VALUES ($o, 'testbank', 2, f_uuid4(), 'pp_S5-5-second', 'pending', 6400, 'EUR');"
-  run WH1 "CALL a_webhook('S5-5-evt-1', '$pp', 'succeeded', 6400, 'EUR', NULL);"
-  run WH2 "CALL a_webhook('S5-5-evt-2', 'pp_S5-5-second', 'succeeded', 6400, 'EUR', NULL);"
+         VALUES ($o, 'testbank', 2, f_uuid4(), 'pp_S5-5-second', 'pending', 6400, 'RUB');"
+  run WH1 "CALL a_webhook('S5-5-evt-1', '$pp', 'succeeded', 6400, 'RUB', NULL);"
+  run WH2 "CALL a_webhook('S5-5-evt-2', 'pp_S5-5-second', 'succeeded', 6400, 'RUB', NULL);"
   check S5.5a "второй платёж принят (succeeded), заказ помечен duplicate_payment" \
     "$(oj WH2 webhook '$.note')/$(q "SELECT CONCAT(status, ':', needs_attention, ':', attention_reason) FROM wp_book_orders WHERE id = $o")" "duplicate_payment/paid:1:duplicate_payment"
-  check S5.5b "в очередь поставлен возврат второго платежа на полную сумму" "$(oj WH2 webhook '$.refund_enqueued.amount') $(oj WH2 webhook '$.refund_enqueued.reason')" "6400 duplicate_payment"
-  checkq S5.5c "экземпляр продан один раз" "SELECT COUNT(*) FROM wp_book_sales WHERE book_item_id = $it" "1"
+  checkq S5.5b "решение о возврате — строка wp_book_refunds в той же транзакции: второй платёж, полная сумма, requested" \
+    "SELECT CONCAT(f.amount, ' ', f.currency, ' ', f.reason, ' ', f.status, ' ', p.provider_payment_id, ' key=', f.idempotency_key REGEXP '^[0-9a-f-]{36}\$')
+       FROM wp_book_refunds f JOIN wp_book_payments p ON p.id = f.payment_id WHERE f.order_id = $o" "6400 RUB duplicate_payment requested pp_S5-5-second key=1"
+  check S5.5c "после COMMIT — задачи AS: uniundata_order_needs_attention и uniundata_refund_payment {refund_id}" \
+    "$(oj WH2 webhook '$.after_commit[*].hook') #$(oj WH2 webhook '$.after_commit[1].args.refund_id')" \
+    "[\"uniundata_order_needs_attention\", \"uniundata_refund_payment\"] #$(q "SELECT id FROM wp_book_refunds WHERE order_id = $o")"
+  checkq S5.5d "экземпляр продан один раз" "SELECT COUNT(*) FROM wp_book_sales WHERE book_item_id = $it" "1"
 }
 
 # ======================================================================================
@@ -624,11 +757,11 @@ s6() {
   sub S6.1 "sold не перетирается, items_conflicts++, цена проданного не меняется"
   sold=$(mk_item S6-SOLD 7000); avail=$(mk_item S6-AVAIL 7100)
   o=$(mk_order 1601 "$sold"); pp=$(pp_of "$o")
-  setup "CALL a_webhook('S6-1-evt', '$pp', 'succeeded', 7000, 'EUR', NULL);"
+  setup "CALL a_webhook('S6-1-evt', '$pp', 'succeeded', 7000, 'RUB', NULL);"
   check S6.1a "исходно экземпляр продан" "$(st "$sold")" "sold"
-  J='[{"external_item_id":"S6-SOLD","status":"present","price_amount":7900,"currency":"EUR"},
-      {"external_item_id":"S6-AVAIL","status":"present","price_amount":7500,"currency":"EUR"},
-      {"external_item_id":"S6-NEW","status":"present","price_amount":1200,"currency":"EUR"}]'
+  J='[{"external_item_id":"S6-SOLD","status":"present","price_amount":7900,"currency":"RUB"},
+      {"external_item_id":"S6-AVAIL","status":"present","price_amount":7500,"currency":"RUB"},
+      {"external_item_id":"S6-NEW","status":"present","price_amount":1200,"currency":"RUB"}]'
   run SYNC "CALL a_sync_start('primary', @r); CALL a_sync_batch(@r, 'primary', '$J'); CALL a_sync_finish(@r, 'primary');"
   timeline
   checkq S6.1b "проданный: sold, sold_at сохранён, цена прежняя (7000), source_status present" \
@@ -643,14 +776,23 @@ s6() {
   checkq S6.1f "повторный прогон того же пакета: sold на месте, конфликт снова посчитан, остальное skipped" \
     "SELECT CONCAT((SELECT availability_status FROM wp_book_items WHERE id = $sold), ' conflicts=', items_conflicts, ' skipped=', items_skipped, ' created=', items_created)
        FROM wp_book_sync_runs WHERE id = (SELECT MAX(id) FROM wp_book_sync_runs)" "sold conflicts=1 skipped=3 created=0"
+  J='[{"external_item_id":"S6-EUR","status":"present","price_amount":1500,"currency":"EUR"},
+      {"external_item_id":"S6-RUB","status":"present","price_amount":1500,"currency":"RUB"}]'
+  run SYNC3 "CALL a_sync_start('primary', @r); CALL a_sync_batch(@r, 'primary', '$J'); CALL a_sync_finish(@r, 'primary');"
+  checkq S6.1g "экземпляр в EUR не импортирован (currency_mismatch, errors_count = 1), в RUB — создан" \
+    "SELECT CONCAT((SELECT COUNT(*) FROM wp_book_items WHERE external_item_id IN ('S6-EUR')), '/',
+                   (SELECT COUNT(*) FROM wp_book_items WHERE external_item_id IN ('S6-RUB')), ' errors=', errors_count, ' ',
+                   JSON_UNQUOTE(JSON_EXTRACT(error_log, '\$[0].code')))
+       FROM wp_book_sync_runs WHERE id = (SELECT MAX(id) FROM wp_book_sync_runs)" "0/1 errors=1 currency_mismatch"
 
   sub S6.2 "синхронизация одновременно с «Отложить»: источник снял книгу, а её резервируют"
   it=$(mk_item S6-RES 7200)
-  J='[{"external_item_id":"S6-RES","status":"withdrawn","price_amount":7200,"currency":"EUR"}]'
+  J='[{"external_item_id":"S6-RES","status":"withdrawn","price_amount":7200,"currency":"RUB"}]'
   run_bg U1 "SET @pause_at = 'reserve.before_commit'; CALL a_reserve(1602, $it);"
   run_bg SYNC "CALL t_wait_paused('U1', 'reserve.before_commit'); CALL a_sync_start('primary', @r); CALL a_sync_batch(@r, 'primary', '$J'); CALL a_sync_finish(@r, 'primary');"
   waitall; timeline
-  check S6.2a "sync ждал X-lock экземпляра, который держит reserve" "$(traced U1 '%SYNC ждёт X,REC_NOT_GAP wp_book_items.PRIMARY%')" "1"
+  check S6.2a "sync A ждал запись книги: UPDATE статуса экземпляра в reserve взял на неё S-lock (FK-индекс ix_items_record_status)" \
+    "$(traced U1 '%SYNC ждёт X,REC_NOT_GAP wp_book_records.PRIMARY%')" "1"
   checkq S6.2b "reserved не перетёрт; source_status = withdrawn; conflicts = 1" \
     "SELECT CONCAT(i.availability_status, '/', i.source_status, '/', r.items_conflicts) FROM wp_book_items i, wp_book_sync_runs r
       WHERE i.id = $it AND r.id = (SELECT MAX(id) FROM wp_book_sync_runs)" "reserved/withdrawn/1"
@@ -659,7 +801,7 @@ s6() {
 
   sub S6.3 "синхронизация первой: «Отложить» ждёт и получает 409 (книга снята)"
   it=$(mk_item S6-RES2 7300)
-  J='[{"external_item_id":"S6-RES2","status":"withdrawn","price_amount":7300,"currency":"EUR"}]'
+  J='[{"external_item_id":"S6-RES2","status":"withdrawn","price_amount":7300,"currency":"RUB"}]'
   run_bg SYNC "SET @pause_at = 'sync.after_items'; CALL a_sync_start('primary', @r); CALL a_sync_batch(@r, 'primary', '$J'); CALL a_sync_finish(@r, 'primary');"
   run_bg U1 "CALL t_wait_paused('SYNC', 'sync.after_items'); CALL a_reserve(1603, $it);"
   waitall; timeline
@@ -667,7 +809,7 @@ s6() {
 
   sub S6.4 "два запуска синхронизации одновременно: GET_LOCK + UNIQUE(running_source)"
   run_bg SYNC1 "CALL a_sync_start('primary', @r); DO SLEEP(2); CALL a_sync_finish(@r, 'primary');"
-  run SYNC2 "CALL t_wait_used('uniundata_sync_primary@$DB'); CALL a_sync_start('primary', @r2);"
+  run SYNC2 "CALL t_wait_used(f_lock_name('sync_primary', 'wp_')); CALL a_sync_start('primary', @r2);"
   check S6.4a "второй запуск сразу выходит: GET_LOCK занят" "$(oc SYNC2 sync_start)" "200 locked"
   expect_err S6.4b "второй running-прогон источника на уровне данных (uq_sync_runs_one_running)" 1062 uq_sync_runs_one_running \
     "INSERT INTO wp_book_sync_runs (source_name, status, started_at, heartbeat_at) VALUES ('primary', 'running', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))"
@@ -676,6 +818,43 @@ s6() {
   run SYNC3 "CALL a_sync_start('secondary', @r3);"
   check S6.4c "процесс умер, строка running осталась: GET_LOCK свободен, но запуск видит running → busy" "$(oc SYNC3 sync_start)" "200 busy"
   q "UPDATE wp_book_sync_runs SET status = 'aborted', finished_at = UTC_TIMESTAMP(6) WHERE source_name = 'secondary' AND status = 'running'"
+
+  local rec
+  sub S6.5 "синхронизация первой (транзакция A держит запись книги) ↔ checkout этой книги: две транзакции sync — без deadlock"
+  it=$(mk_item S6-CO1 7400)
+  setup "CALL a_reserve(1604, $it);"
+  J='[{"external_item_id":"S6-CO1","status":"withdrawn","price_amount":7400,"currency":"RUB"}]'
+  run_bg SYNC "SET @pause_at = 'sync.after_records'; CALL a_sync_start('primary', @r); CALL a_sync_batch(@r, 'primary', '$J'); CALL a_sync_finish(@r, 'primary');"
+  run_bg CO "CALL t_wait_paused('SYNC', 'sync.after_records'); CALL a_checkout(1604, '$(uuid)', 7400, 'RUB');"
+  waitall; timeline
+  check S6.5a "checkout (уже держит экземпляр) ждёт S-блокировку записи книги — проверка FK при INSERT order_items" \
+    "$(traced SYNC '%CO ждёт S,REC_NOT_GAP wp_book_records.PRIMARY%')" "1"
+  check S6.5b "sync A не ждёт экземпляров и фиксируется; checkout 201; sync B — applied; deadlock нет" \
+    "$(oc CO checkout) / $(oc SYNC sync_batch) / $(deadlocks)" "201 created / 200 applied / 0"
+  checkq S6.5c "B ждал экземпляр до COMMIT checkout и не перетёр checkout_pending: source_status = withdrawn, конфликт посчитан" \
+    "SELECT CONCAT(i.availability_status, '/', i.source_status, '/', r.items_conflicts) FROM wp_book_items i, wp_book_sync_runs r
+      WHERE i.id = $it AND r.id = (SELECT MAX(id) FROM wp_book_sync_runs)" "checkout_pending/withdrawn/1"
+
+  sub S6.6 "checkout первым (X на экземпляре, S на записи от FK) ↔ синхронизация: A ждёт запись, B видит checkout_pending"
+  it=$(mk_item S6-CO2 7500)
+  setup "CALL a_reserve(1605, $it);"
+  J='[{"external_item_id":"S6-CO2","status":"present","price_amount":7900,"currency":"RUB"}]'
+  run_bg CO "SET @pause_at = 'checkout.before_commit'; CALL a_checkout(1605, '$(uuid)', 7500, 'RUB');"
+  run_bg SYNC "CALL t_wait_paused('CO', 'checkout.before_commit'); CALL a_sync_start('primary', @r); CALL a_sync_batch(@r, 'primary', '$J'); CALL a_sync_finish(@r, 'primary');"
+  waitall; timeline
+  check S6.6a "sync A ждал X-блокировку записи, на которой checkout держит S" "$(traced CO '%SYNC ждёт X,REC_NOT_GAP wp_book_records.PRIMARY%')" "1"
+  check S6.6b "checkout 201, sync applied, deadlock нет" "$(oc CO checkout) / $(oc SYNC sync_batch) / $(deadlocks)" "201 created / 200 applied / 0"
+  checkq S6.6c "экземпляр checkout_pending, новая цена 7900 записана, в заказе — снимок 7500" \
+    "SELECT CONCAT(i.availability_status, '/', i.price_amount, '/', oi.unit_price_amount) FROM wp_book_items i
+       JOIN wp_book_order_items oi ON oi.book_item_id = i.id WHERE i.id = $it" "checkout_pending/7900/7500"
+
+  sub S6.7 "контроль: синхронизация в ОДНОЙ транзакции (records → items) против checkout (items → records по FK) = deadlock"
+  it=$(mk_item S6-CO3 7600); rec=$(q "SELECT book_record_id FROM wp_book_items WHERE id = $it")
+  setup "CALL a_reserve(1606, $it);"
+  run_bg BAD "SET @pause_at = 'pair.after_first'; CALL n_lock_pair('records', $rec, 'items', $it);"
+  run_bg CO "CALL t_wait_paused('BAD', 'pair.after_first'); CALL a_checkout(1606, '$(uuid)', 7600, 'RUB');"
+  waitall; timeline
+  check S6.7a "MySQL обнаружил deadlock (ровно один 1213) — поэтому SyncService пишет записи и экземпляры разными транзакциями" "$(deadlocks)" "1"
 }
 
 # ======================================================================================
@@ -687,7 +866,7 @@ s7() {
 
   sub S7.1 "webhook успел первым (держит экземпляр) → pass B ждёт и ничего не освобождает"
   it=$(mk_item S7-1 8000); o=$(mk_order 1701 "$it"); pp=$(pp_of "$o")
-  run_bg WH "SET @pause_at = 'apply.before_commit'; CALL a_webhook('S7-1-evt', '$pp', 'succeeded', 8000, 'EUR', NULL);"
+  run_bg WH "SET @pause_at = 'apply.before_commit'; CALL a_webhook('S7-1-evt', '$pp', 'succeeded', 8000, 'RUB', NULL);"
   run_bg CRON "CALL t_wait_paused('WH', 'apply.before_commit'); CALL a_expire_order_one($o, 'pending');" 41
   waitall; timeline
   check S7.1a "pass B ждал X-lock экземпляра, удерживаемый webhook" "$(traced WH '%CRON ждёт X,REC_NOT_GAP wp_book_items.PRIMARY%')" "1"
@@ -697,7 +876,7 @@ s7() {
   sub S7.2 "pass B успел первым (заказ payment_expired) → поздний платёж забирает свободный экземпляр"
   it=$(mk_item S7-2 8100); o=$(mk_order 1702 "$it"); pp=$(pp_of "$o")
   run_bg CRON "SET @pause_at = 'oexp.before_commit'; CALL a_expire_order_one($o, 'pending');" 41
-  run_bg WH "CALL t_wait_paused('CRON', 'oexp.before_commit'); CALL a_webhook('S7-2-evt', '$pp', 'succeeded', 8100, 'EUR', NULL);"
+  run_bg WH "CALL t_wait_paused('CRON', 'oexp.before_commit'); CALL a_webhook('S7-2-evt', '$pp', 'succeeded', 8100, 'RUB', NULL);"
   waitall; timeline
   check S7.2a "webhook ждал X-lock экземпляра, удерживаемый pass B" "$(traced CRON '%WH ждёт X,REC_NOT_GAP wp_book_items.PRIMARY%')" "1"
   check S7.2b "pass B: payment_expired; webhook: late_payment_reacquired" "$(oc CRON expire_order) / $(oj WH webhook '$.note')" "200 payment_expired / late_payment_reacquired"
@@ -712,7 +891,7 @@ s7() {
   it=$(mk_item S7-3 8200); o=$(mk_order 1703 "$it"); pp=$(pp_of "$o")
   run CRON "CALL a_expire_order_one($o, 'pending');" 41
   run_bg U2 "SET @pause_at = 'reserve.before_commit'; CALL a_reserve(1704, $it);"
-  run_bg WH "CALL t_wait_paused('U2', 'reserve.before_commit'); CALL a_webhook('S7-3-evt', '$pp', 'succeeded', 8200, 'EUR', NULL);"
+  run_bg WH "CALL t_wait_paused('U2', 'reserve.before_commit'); CALL a_webhook('S7-3-evt', '$pp', 'succeeded', 8200, 'RUB', NULL);"
   waitall; timeline
   check S7.3a "webhook ждал X-lock экземпляра, который держит резерв U2" "$(traced U2 '%WH ждёт X,REC_NOT_GAP wp_book_items.PRIMARY%')" "1"
   check S7.3b "U2 получил резерв; webhook: late_payment_conflict" "$(oc U2 reserve) / $(oj WH webhook '$.note')" "201 created / late_payment_conflict"
@@ -720,7 +899,8 @@ s7() {
     "SELECT CONCAT(o.status, ':', o.needs_attention, ':', o.attention_reason, '/', (SELECT COUNT(*) FROM wp_book_sales WHERE book_item_id = $it), '/',
                    i.availability_status, ':', (SELECT user_id FROM wp_book_reservations WHERE active_book_item_id = $it))
        FROM wp_book_orders o JOIN wp_book_items i ON i.id = $it WHERE o.id = $o" "paid:1:late_payment_conflict/0/reserved:1704"
-  check S7.3d "в очередь поставлен возврат полной суммы" "$(oj WH webhook '$.refund_enqueued.amount') $(oj WH webhook '$.refund_enqueued.reason')" "8200 late_payment_conflict"
+  checkq S7.3d "возврат полной суммы записан строкой wp_book_refunds (requested), задача AS — после COMMIT" \
+    "SELECT CONCAT(amount, ' ', reason, ' ', status) FROM wp_book_refunds WHERE order_id = $o" "8200 late_payment_conflict requested"
 
   sub S7.4 "pass A не освобождает экземпляр, по которому идёт оплата (checkout_pending)"
   it=$(mk_item S7-4 8300); o=$(mk_order 1705 "$it")
@@ -733,7 +913,7 @@ s7() {
   sweep
   it=$(mk_item S7-5 8400)
   setup "CALL a_reserve(1706, $it);"
-  run_bg CO "SET @pause_at = 'checkout.before_commit'; CALL a_checkout(1706, '$(uuid)', 8400, 'EUR');" 59
+  run_bg CO "SET @pause_at = 'checkout.before_commit'; CALL a_checkout(1706, '$(uuid)', 8400, 'RUB');" 59
   run_bg CRON "CALL t_wait_paused('CO', 'checkout.before_commit'); CALL a_expire_reservations(200);" 61
   waitall; timeline
   check S7.5a "pass A ждал корзину пользователя (1-й уровень порядка)" "$(traced CO '%CRON ждёт X,REC_NOT_GAP wp_book_carts.PRIMARY%')" "1"
@@ -745,7 +925,7 @@ s7() {
   it=$(mk_item S7-6 8500)
   setup "CALL a_reserve(1707, $it);"
   run_bg CRON "SET @pause_at = 'expA.before_commit'; CALL a_expire_reservations(200);" 61
-  run_bg CO "CALL t_wait_paused('CRON', 'expA.before_commit'); CALL a_checkout(1707, '$(uuid)', 8500, 'EUR');" 59
+  run_bg CO "CALL t_wait_paused('CRON', 'expA.before_commit'); CALL a_checkout(1707, '$(uuid)', 8500, 'RUB');" 59
   waitall; timeline
   check S7.6a "checkout ждал корзину, которую держит pass A" "$(traced CRON '%CO ждёт X,REC_NOT_GAP wp_book_carts.uq_carts_one_open_per_user%')" "1"
   check S7.6b "pass A: expired; checkout: 409 cart_empty (корзина закрыта как expired)" "$(oc CRON expire_res) / $(oc CO checkout)" "200 expired / 409 uniundata_cart_empty"
@@ -767,7 +947,7 @@ s7() {
   done
   t0=$(start_gun 1.0)
   for k in $(seq 0 11); do
-    run_bg "W$k" "CALL t_start_at($t0 + $((k % 2 == 1 ? 3 : 0)) / 100); CALL t_retry('CALL a_webhook(''S7-8-evt-$k'', ''${pps[$k]}'', ''succeeded'', $((9001 + k)), ''EUR'', NULL)', 'webhook');"
+    run_bg "W$k" "CALL t_start_at($t0 + $((k % 2 == 1 ? 3 : 0)) / 100); CALL t_retry('CALL a_webhook(''S7-8-evt-$k'', ''${pps[$k]}'', ''succeeded'', $((9001 + k)), ''RUB'', NULL)', 'webhook');"
     # чётные заказы: pass B стартует на 30 мс позже webhook, нечётные — webhook на 30 мс позже pass B
     run_bg "C$k" "CALL t_start_at($t0 + $((k % 2 == 0 ? 3 : 0)) / 100); CALL t_retry('CALL a_expire_order_one(${orders[$k]}, ''pending'')', 'expire_order');" 41
   done
@@ -779,6 +959,22 @@ s7() {
             WHERE o.id IN ($(IFS=,; echo "${orders[*]}"))")
   check S7.8b "каждый заказ оплачен, каждый экземпляр продан ровно один раз" "$res" "12 paid, 12 sold, 12 sales"
   echo "           ветки: $(q "SELECT GROUP_CONCAT(CONCAT(n, '× ', k) SEPARATOR ', ') FROM (SELECT CONCAT(op, ':', IF(op = 'webhook', COALESCE(NULLIF(JSON_UNQUOTE(JSON_EXTRACT(data, '\$.note')), ''), code), code)) k, COUNT(*) n FROM t_outcome WHERE scn = 'S7.8' GROUP BY k) x")"
+
+  sub S7.9 "поздний платёж, а источник за время оплаты снял книгу (source_status = withdrawn)"
+  local J
+  it=$(mk_item S7-9 8700); o=$(mk_order 1709 "$it"); pp=$(pp_of "$o")
+  J='[{"external_item_id":"S7-9","status":"withdrawn","price_amount":8700,"currency":"RUB"}]'
+  setup "CALL a_sync_start('primary', @r); CALL a_sync_batch(@r, 'primary', '$J'); CALL a_sync_finish(@r, 'primary');"
+  check S7.9a "sync не тронул checkout_pending, записал source_status = withdrawn" \
+    "$(st "$it")/$(q "SELECT source_status FROM wp_book_items WHERE id = $it")" "checkout_pending/withdrawn"
+  run CRON "CALL a_expire_order_one($o, 'pending');" 41
+  check S7.9b "pass B: заказ payment_expired, экземпляр получил release target withdrawn" "$(ost "$o")/$(st "$it")" "payment_expired/withdrawn"
+  run WH "CALL a_webhook('S7-9-evt', '$pp', 'succeeded', 8700, 'RUB', NULL);"
+  timeline
+  check S7.9c "webhook: свободный экземпляр (withdrawn, без резерва) забран и продан" "$(oj WH webhook '$.note')/$(st "$it")" "late_payment_reacquired/sold"
+  checkq S7.9d "заказ paid + needs_attention = late_payment_source_check (проверить книгу физически), возврата нет" \
+    "SELECT CONCAT(status, ':', needs_attention, ':', attention_reason, '/', (SELECT COUNT(*) FROM wp_book_refunds WHERE order_id = $o))
+       FROM wp_book_orders WHERE id = $o" "paid:1:late_payment_source_check/0"
 }
 
 # ======================================================================================
@@ -818,13 +1014,13 @@ s8() {
      VALUES ($a, 1899, 'cancelled', 1, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6) + INTERVAL 1 HOUR, UTC_TIMESTAMP(6))"
   expect_err S8.3c "вторая активная позиция той же книги даже в той же корзине (uq_cart_items_one_active_per_item)" 1062 uq_cart_items_one_active_per_item \
     "INSERT INTO wp_book_cart_items (cart_id, book_item_id, reservation_id, unit_price_amount, currency, status, added_at, expires_at)
-     SELECT cart_id, book_item_id, (SELECT MAX(id) FROM wp_book_reservations WHERE user_id = 1899), 1, 'EUR', 'active', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6) + INTERVAL 1 HOUR
+     SELECT cart_id, book_item_id, (SELECT MAX(id) FROM wp_book_reservations WHERE user_id = 1899), 1, 'RUB', 'active', UTC_TIMESTAMP(6), UTC_TIMESTAMP(6) + INTERVAL 1 HOUR
        FROM wp_book_cart_items WHERE cart_id = $cart AND status = 'active'"
 
   sub S8.4 "reserve и checkout одного пользователя параллельно — checkout первым"
   a=$(mk_item S8-4A 9200); b=$(mk_item S8-4B 9300); c=$(mk_item S8-4C 9400)
   setup "CALL a_reserve(1804, $a); CALL a_reserve(1804, $b);"
-  run_bg CO "SET @pause_at = 'checkout.after_items'; CALL a_checkout(1804, '$(uuid)', 18500, 'EUR');"
+  run_bg CO "SET @pause_at = 'checkout.after_items'; CALL a_checkout(1804, '$(uuid)', 18500, 'RUB');"
   run_bg RS "CALL t_wait_paused('CO', 'checkout.after_items'); CALL a_reserve(1804, $c);"
   waitall; timeline
   check S8.4a "reserve ждал на корзине (уровень 1), а не на экземплярах" "$(traced CO '%RS ждёт X,REC_NOT_GAP wp_book_carts.%')" "1"
@@ -837,7 +1033,7 @@ s8() {
   a=$(mk_item S8-5A 9500); b=$(mk_item S8-5B 9600); c=$(mk_item S8-5C 9700)
   setup "CALL a_reserve(1805, $a); CALL a_reserve(1805, $b);"
   run_bg RS "SET @pause_at = 'reserve.before_commit'; CALL a_reserve(1805, $c);"
-  run_bg CO "CALL t_wait_paused('RS', 'reserve.before_commit'); CALL a_checkout(1805, '$(uuid)', 19100, 'EUR');"
+  run_bg CO "CALL t_wait_paused('RS', 'reserve.before_commit'); CALL a_checkout(1805, '$(uuid)', 19100, 'RUB');"
   waitall; timeline
   check S8.5a "checkout ждал корзину; увидел три книги → 409 cart_changed (сумма 28800 ≠ 19100)" \
     "$(oc RS reserve) / $(oc CO checkout) $(oj CO checkout '$.actual_total_amount')" "201 created / 409 uniundata_cart_changed 28800"
@@ -848,7 +1044,7 @@ s8() {
   setup "CALL a_reserve(1806, $a); CALL a_reserve(1806, $b);"
   cart=$(q "SELECT id FROM wp_book_carts WHERE open_cart_user_id = 1806")
   run_bg BAD "SET @pause_at = 'pair.after_first'; CALL n_lock_pair('items', $a, 'carts', $cart);"
-  run_bg CO "CALL t_wait_paused('BAD', 'pair.after_first'); CALL a_checkout(1806, '$(uuid)', 19700, 'EUR');"
+  run_bg CO "CALL t_wait_paused('BAD', 'pair.after_first'); CALL a_checkout(1806, '$(uuid)', 19700, 'RUB');"
   waitall; timeline
   check S8.6a "MySQL обнаружил deadlock (ровно один 1213)" "$(deadlocks)" "1"
 
@@ -865,7 +1061,7 @@ s8() {
     t0=$(start_gun 0.8)
     for k in $(seq 1 12); do
       u=${users[$((k - 1))]%%:*}
-      run_bg "CO$round.$k" "CALL t_start_at($t0); CALL t_retry('CALL a_checkout($u, ''$(uuid)'', 2000, ''EUR'')', 'checkout');"
+      run_bg "CO$round.$k" "CALL t_start_at($t0); CALL t_retry('CALL a_checkout($u, ''$(uuid)'', 2000, ''RUB'')', 'checkout');"
       run_bg "RS$round.$k" "CALL t_start_at($t0); CALL t_retry('CALL a_reserve($u, ${users[$((k - 1))]#*:})', 'reserve');"
     done
     waitall
@@ -879,7 +1075,7 @@ s8() {
         AND COALESCE((SELECT p.msg FROM t_trace p WHERE p.scn = r.scn AND p.sess = r.sess AND p.id < r.id ORDER BY p.id DESC LIMIT 1), '')
             NOT LIKE 'открытой корзины нет%'" "0"
   xflaky S8.7e "без повтора: ни одного deadlock" "$(retried) повторено" "0 повторено" \
-    "INSERT … ON DUPLICATE KEY UPDATE новой корзины проверяет дубликат по delete-marked записи только что закрытой корзины в uq_carts_one_open_per_user (generated column) и ставит next-key/gap-блокировки даже в READ COMMITTED; две такие вставки соседних user_id ждут insert intention друг друга. Инварианты не нарушаются, Db::transaction() повторяет транзакцию"
+    "редкий deadlock корзины (docs/10 § 10.10): INSERT … ON DUPLICATE KEY UPDATE новой корзины проверяет дубликат по delete-marked записи только что закрытой корзины в uq_carts_one_open_per_user и ставит next-key/gap-блокировки даже в READ COMMITTED. Инварианты не нарушаются, Db::transaction() повторяет транзакцию"
   if [[ "$(retried)" != 0 ]]; then echo "           последний deadlock InnoDB (SHOW ENGINE INNODB STATUS):"; last_deadlock; fi
   echo "           исходы checkout: $(q "SELECT GROUP_CONCAT(CONCAT(n, '× ', code) SEPARATOR ', ') FROM (SELECT code, COUNT(*) n FROM t_outcome WHERE scn = 'S8.7' AND op = 'checkout' AND retried = 0 GROUP BY code) x")"
 
@@ -887,8 +1083,8 @@ s8() {
   a=$(mk_item S8-8 2222)
   setup "CALL a_reserve(1807, $a);"
   k=$(uuid)
-  run_bg CO1 "SET @pause_at = 'checkout.before_commit'; CALL a_checkout(1807, '$k', 2222, 'EUR');"
-  run_bg CO2 "CALL t_wait_paused('CO1', 'checkout.before_commit'); CALL a_checkout(1807, '$k', 2222, 'EUR');"
+  run_bg CO1 "SET @pause_at = 'checkout.before_commit'; CALL a_checkout(1807, '$k', 2222, 'RUB');"
+  run_bg CO2 "CALL t_wait_paused('CO1', 'checkout.before_commit'); CALL a_checkout(1807, '$k', 2222, 'RUB');"
   waitall; timeline
   check S8.8a "первый 201, второй 200 replayed с тем же заказом" \
     "$(oc CO1 checkout) / $(oc CO2 checkout) #$(oj CO2 checkout '$.order_id')" "201 created / 200 replayed #$(oj CO1 checkout '$.order_id')"
@@ -905,8 +1101,8 @@ s9() {
   while IFS=$'\t' read -r name n; do
     check "${name%% *}" "${name#* }" "$n" "0"
   done < <(q "SELECT name, violations FROM t_invariants")
-  checkq S9.dl "неповторённых deadlock (1213) вне контрольных сценариев S7.7, S8.2, S8.6 — ни одного" \
-    "SELECT COUNT(*) FROM t_outcome WHERE errno = 1213 AND retried = 0 AND scn NOT IN ('S7.7', 'S8.2', 'S8.6')" "0"
+  checkq S9.dl "неповторённых deadlock (1213) вне контрольных сценариев S6.7, S7.7, S8.2, S8.6 — ни одного" \
+    "SELECT COUNT(*) FROM t_outcome WHERE errno = 1213 AND retried = 0 AND scn NOT IN ('S6.7', 'S7.7', 'S8.2', 'S8.6')" "0"
   echo "           повторённых (как Db::transaction) deadlock-ов за прогон: $(q "SELECT COALESCE(GROUP_CONCAT(CONCAT(scn, ': ', n) SEPARATOR ', '), '0') FROM (SELECT scn, COUNT(*) n FROM t_outcome WHERE retried = 1 GROUP BY scn) x")"
   checkq S9.lw "lock wait timeout (1205) — ни одного" "SELECT COUNT(*) FROM t_outcome WHERE errno = 1205" "0"
   echo "--- индексы точечных запросов алгоритмов (EXPLAIN на реальных строках после сценариев)"
@@ -936,7 +1132,7 @@ s9
 
 echo
 echo "======================================================================================"
-printf 'ИТОГ: PASS %d, FAIL %d, EXPECTED-FAIL %d, XPASS %d\n' "$PASS" "$FAIL" "$XFAIL" "$XPASS"
+printf 'ИТОГ: PASS %d, FAIL %d, EXPECTED-FAIL %d\n' "$PASS" "$FAIL" "$XFAIL"
 if ((FAIL > 0)); then
   echo "Провалены: ${FAILED[*]}"
   exit 1

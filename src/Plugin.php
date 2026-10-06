@@ -23,7 +23,7 @@ use Uniundata\Books\Sync\SyncService;
  * Bootstrap плагина: контейнер сервисов, хуки WordPress, REST, Action Scheduler, WP-CLI, права, приватность.
  *
  * Порядок (docs/01-architecture.md § 1.4):
- *   register_activation_hook → activate(): окружение + миграции + роли + options по умолчанию;
+ *   register_activation_hook → activate(): окружение + миграции и options по умолчанию (Migrator) + роли;
  *   plugins_loaded (5)       → boot(): догоняющая миграция, остальные хуки;
  *   init                     → Roles::maybeUpgrade(), register_meta(middle_name);
  *   rest_api_init            → Rest\*Controller::register_routes();
@@ -166,7 +166,7 @@ final class Plugin
         self::installForSite();
     }
 
-    /** Таблицы (с префиксом текущего сайта), роли и options по умолчанию. Также wp_initialize_site. */
+    /** Таблицы (с префиксом текущего сайта), options по умолчанию (Migrator::DEFAULT_OPTIONS), роли. Также wp_initialize_site. */
     public static function installForSite(): void
     {
         $plugin = self::instance();
@@ -180,17 +180,6 @@ final class Plugin
             );
         }
         Roles::install();
-
-        // add_option не перезаписывает значения администратора при повторной активации.
-        add_option('uniundata_payment_ttl_minutes', 30);
-        add_option('uniundata_payment_grace_minutes', 10);
-        add_option('uniundata_reservation_minutes', 60); // менять только вместе с бизнес-правилами
-        add_option('uniundata_max_active_reservations', 10);
-        add_option('uniundata_sync_source', 'primary', '', false);
-        add_option('uniundata_terms_versions', [], '', false); // заполняет администратор: version + sha256
-        // uniundata_currency (ISO 4217, «валюта магазина») по умолчанию НЕ задаётся: её выбирает администратор
-        // (`wp option update uniundata_currency RUB`). Пока её нет — резерв, checkout и синхронизация
-        // отказывают, а в админке висит уведомление (configProblems()).
     }
 
     /** Таблицы, роли и данные остаются: деактивация обратима. Снимаются только задачи плагина. */
@@ -519,8 +508,7 @@ final class Plugin
             }
         }
 
-        // 4. ПДн — после удаления строки wp_users, идемпотентно, задачей Action Scheduler. Без unique: в AS 3.9
-        //    уникальность проверяется по hook + group БЕЗ args, и задача второго удалённого пользователя пропала бы.
+        // 4. ПДн — после удаления строки wp_users, идемпотентно, задачей Action Scheduler.
         if (\function_exists('as_enqueue_async_action')) {
             as_enqueue_async_action(Scheduler::HOOK_USER_CLEANUP, ['user_id' => $userId], Scheduler::GROUP);
         }
@@ -939,6 +927,11 @@ final class Plugin
         }
         if (!\function_exists('as_enqueue_async_action')) {
             $problems[] = __('Action Scheduler is not loaded: reservations and unpaid orders are not released.', 'uniundata-books');
+        } elseif (class_exists(\ActionScheduler_Versions::class)
+            && version_compare((string) \ActionScheduler_Versions::instance()->latest_version(), Scheduler::MIN_ACTION_SCHEDULER_VERSION, '<')) {
+            // Активна самая новая копия AS среди всех плагинов; старше 4.2 — unique без учёта args теряет задачи.
+            /* translators: %s: minimal version */
+            $problems[] = \sprintf(__('Action Scheduler %s or newer is required (composer woocommerce/action-scheduler).', 'uniundata-books'), Scheduler::MIN_ACTION_SCHEDULER_VERSION);
         }
 
         return $problems;

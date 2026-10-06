@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Uniundata\Books\Service;
 
 use Uniundata\Books\Domain\DomainError;
+use Uniundata\Books\Domain\ItemStatus;
 use Uniundata\Books\Infrastructure\AuditLog;
 use Uniundata\Books\Infrastructure\Db;
 use Uniundata\Books\Payment\FiscalReceipt;
@@ -690,10 +691,14 @@ final class CheckoutService
         }
         $ttl = max(self::MIN_SESSION_SECONDS, (int) $p['seconds_to_due'] - $graceMinutes * 60);
         $publicOrderId = (string) $p['public_order_id'];
-        // 54-ФЗ: позиции и контакт для чека; итог сверяется с суммой платежа до вызова банка.
-        $receipt = $this->receiptForOrder($orderId, (int) $p['amount']);
 
+        $stage = 'receipt';
         try {
+            // 54-ФЗ: позиции и контакт для чека; итог сверяется с суммой платежа до вызова банка. Ошибка чека
+            // (фильтр uniundata_fiscal_receipt, расхождение суммы) — такой же отказ, как сбой createSession:
+            // платёж created → cancelled, иначе заказ остался бы draft с «висящей» попыткой.
+            $receipt = $this->receiptForOrder($orderId, (int) $p['amount']);
+            $stage = 'createSession';
             $session = $this->provider->createSession(
                 $publicOrderId,
                 (string) $p['idempotency_key'],
@@ -706,7 +711,7 @@ final class CheckoutService
             );
         } catch (\Throwable $e) {
             // В лог — только класс исключения: сообщение адаптера может содержать ответ банка.
-            error_log(\sprintf('[uniundata] createSession failed for payment #%d: %s', $paymentId, $e::class));
+            error_log(\sprintf('[uniundata] %s failed for payment #%d: %s', $stage, $paymentId, $e::class));
             $orderStatus = $this->db->transaction(fn (): string => $this->markSessionFailedTx($orderId, $paymentId, $userId));
             throw new DomainError(
                 'uniundata_payment_provider_error',
@@ -1177,11 +1182,7 @@ final class CheckoutService
 
     private function releaseTarget(string $sourceStatus): string
     {
-        return match ($sourceStatus) {
-            'missing' => 'sync_missing',
-            'withdrawn' => 'withdrawn',
-            default => 'available',
-        };
+        return ItemStatus::releaseTarget($sourceStatus)->value;
     }
 
     // =================================================================================================

@@ -1476,7 +1476,7 @@ final class SyncService
     private static function error(?string $externalId, string $code, string $message, bool $counted = true): array
     {
         return [
-            'at' => gmdate('Y-m-d\TH:i:s\Z'),
+            'at' => (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.v\Z'), // как Db::toIso8601()
             'external_id' => $externalId,
             'code' => $code,
             'message' => mb_substr($message, 0, 300),

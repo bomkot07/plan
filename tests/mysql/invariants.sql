@@ -87,4 +87,20 @@ SELECT 'I15 webhook-событие processed не более одного раз
 UNION ALL
 SELECT 'I16 сумма заказа = сумма снимков позиций', COUNT(*)
   FROM wp_book_orders o
- WHERE o.subtotal_amount <> (SELECT COALESCE(SUM(oi.unit_price_amount), 0) FROM wp_book_order_items oi WHERE oi.order_id = o.id);
+ WHERE o.subtotal_amount <> (SELECT COALESCE(SUM(oi.unit_price_amount), 0) FROM wp_book_order_items oi WHERE oi.order_id = o.id)
+UNION ALL
+-- I17: деньги не теряются — решение «вернуть» записано строкой wp_book_refunds в той же транзакции
+SELECT 'I17 duplicate_payment / late_payment_conflict ⇒ есть строка возврата', COUNT(*)
+  FROM wp_book_orders o
+ WHERE o.needs_attention = 1 AND o.attention_reason IN ('duplicate_payment', 'late_payment_conflict')
+   AND NOT EXISTS (SELECT 1 FROM wp_book_refunds f WHERE f.order_id = o.id AND f.reason = o.attention_reason)
+UNION ALL
+SELECT 'I18 невозвращённых (не failed) возвратов по платежу не больше суммы платежа', COUNT(*)
+  FROM wp_book_payments p
+ WHERE (SELECT COALESCE(SUM(f.amount), 0) FROM wp_book_refunds f WHERE f.payment_id = p.id AND f.status <> 'failed') > p.amount
+UNION ALL
+SELECT 'I19 активных непросроченных резервов на пользователя ≤ uniundata_max_active_reservations', COUNT(*)
+  FROM (SELECT user_id FROM wp_book_reservations
+         WHERE reservation_status = 'active' AND expires_at > UTC_TIMESTAMP(6)
+         GROUP BY user_id
+        HAVING COUNT(*) > (SELECT CAST(option_value AS UNSIGNED) FROM wp_options WHERE option_name = 'uniundata_max_active_reservations')) x;
