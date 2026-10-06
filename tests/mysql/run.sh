@@ -571,7 +571,7 @@ s3() {
   run U2 "CALL a_reserve(1302, $it);"
   check S3.1e "лимит персональный: другой пользователь резервирует" "$(oc U2 reserve) attempt $(oj U2 reserve '$.attempt_no')" "201 created attempt 1"
 
-  sub S3.2 "второй рубеж: код без проверки лимита упирается в CHECK ck_reservations_attempt_range"
+  sub S3.2 "второй рубеж: код без проверки лимита упирается в CHECK wp_book_reservations_chk_attempt_range"
   run U1 "CALL a_remove(1302, $it); CALL n_reserve(1301, $it);"
   check S3.2a "наивный INSERT attempt_no = 4 → ERROR 3819 → 409 limit_reached" \
     "$(q "SELECT CONCAT(errno, ' ', http, ' ', code) FROM t_outcome WHERE scn = 'S3.2' AND op = 'naive_reserve'")" \

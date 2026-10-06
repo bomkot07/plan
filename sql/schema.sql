@@ -186,7 +186,7 @@ CREATE TABLE wp_book_items (
                          COMMENT 'Внешний book_id = один физический экземпляр. Две одинаковые книги имеют разные ID',
   inventory_number       VARCHAR(64)  NULL,
   price_amount           INT UNSIGNED NOT NULL COMMENT 'В минимальных единицах (центы)',
-  currency               CHAR(3)      CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'EUR',
+  currency               CHAR(3)      CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'RUB',
   condition_code         VARCHAR(16)  CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL DEFAULT 'good',
   condition_note         TEXT         NULL,
   cover_url              VARCHAR(2048) NULL,

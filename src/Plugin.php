@@ -767,7 +767,7 @@ final class Plugin
                 SET o.customer_first_name = %s, o.customer_last_name = %s, o.customer_middle_name = NULL,
                     o.billing_address_json = IF(o.billing_address_json IS NULL, NULL,
                         JSON_OBJECT('v', 1, 'redacted', TRUE,
-                                    'country_code', JSON_UNQUOTE(JSON_EXTRACT(o.billing_address_json, '$.country_code'))))
+                                    'country', JSON_UNQUOTE(JSON_EXTRACT(o.billing_address_json, '$.country'))))
               WHERE o.pii_erased_at IS NOT NULL
                 AND o.customer_last_name <> %s
                 AND COALESCE(o.completed_at, o.cancelled_at, o.paid_at, o.placed_at, o.created_at)
@@ -847,7 +847,7 @@ final class Plugin
                     o.customer_phone = NULL,
                     o.shipping_address_json = IF(o.shipping_address_json IS NULL, NULL,
                         JSON_OBJECT('v', 1, 'redacted', TRUE,
-                                    'country_code', JSON_UNQUOTE(JSON_EXTRACT(o.shipping_address_json, '$.country_code')))),
+                                    'country', JSON_UNQUOTE(JSON_EXTRACT(o.shipping_address_json, '$.country')))),
                     o.pii_erased_at = UTC_TIMESTAMP(6)
               WHERE {$where} AND o.pii_erased_at IS NULL AND {$this->closedOrderSql($db)}",
             ...$args,

@@ -113,6 +113,7 @@ rest_authentication_errors (cookie+nonce / Application Password)
 | 13 | `POST /admin/items/{id}/unblock` | то же | `manage_book_catalog` | да (cookie) | 60/мин | 200 |
 | 14 | `POST /admin/sync/run` | то же | `manage_book_sync` | да (cookie) | 60/мин | 202 |
 | 15 | `GET /admin/sync/runs` | то же | `manage_book_sync` | да (cookie) | — | 200 |
+| 16 | `POST /admin/orders/{public_order_id}/refunds` | то же | `manage_book_orders` | да (cookie) | 60/мин | 202 |
 
 `permission_callback` пользовательских маршрутов возвращает 401 `uniundata_auth_required`, если
 пользователь не определён, и 403 `uniundata_forbidden`, если нет capability. Значение `'__return_true'`
@@ -464,15 +465,25 @@ ID корзины и резерва читаются до транзакции �
 | `{"queued": false, "reason": "already_running", "running_run": {…}}` | Есть `running`-прогон с heartbeat моложе 15 минут (`SyncService::STALE_AFTER_SECONDS = 900`) |
 | `{"queued": true, "reason": "stale_running_replaced", …}` | `running`-прогон завис (heartbeat старше 15 мин). Новая задача поставлена, `SyncService` прервёт зависший прогон |
 
-Флаг `unique` у `as_enqueue_async_action` здесь не используется: в Action Scheduler 3.x уникальность
-проверяется по hook + group **без** args (проверено по исходникам 3.9.0), и ожидающая ежедневная задача того же
-hook-а навсегда блокировала бы ручной запуск. Двойной клик двух администраторов в одну секунду даст две
+Флаг `unique` у `as_enqueue_async_action` здесь не используется: ожидающая ежедневная задача того же hook-а
+не должна блокировать ручной запуск (плагин требует Action Scheduler ^4.2, где unique учитывает args, но
+в 3.x уникальность проверялась по hook + group без args, поэтому код на флаг не полагается). Двойной клик двух администраторов в одну секунду даст две
 задачи; вторая получит от `SyncService` `locked`/`busy` (GET_LOCK + `uq_sync_runs_one_running`) и ничего не сделает.
 
 **`GET /admin/sync/runs`** (`manage_book_sync`): `page`, `per_page` (1…100), `source`, `status`
 (`running|succeeded|partial|failed|aborted`). Ответ `{runs:[{id, source_name, triggered_by, status,
 started_at, heartbeat_at, finished_at, source_cursor, counters:{records_received, …, errors_count},
 error_log:[{external_id, code, message}]}], page, per_page, total}` + `X-WP-Total`.
+
+**`POST /admin/orders/{public_order_id}/refunds`** (`manage_book_orders`): возврат денег по решению менеджера.
+Тело: `amount` (integer ≥ 1, копейки, не больше невозвращённого остатка платежа), `reason`
+(`order_cancelled | customer_return | manual`), `payment_attempt` (необязательно, по умолчанию — платёж, которым
+оплачен заказ). В транзакции создаётся строка `wp_book_refunds` со статусом `requested`, после `COMMIT` ставится задача
+Action Scheduler `uniundata_refund_payment {refund_id}`, которая обращается к банку с ключом идемпотентности.
+Ответ `202 {"refund_id": 17, "status": "requested"}`. Итоговый статус возврата и `refunded_amount` видны в
+`GET /orders/{public_order_id}` (у менеджера — со списком возвратов). Ошибки: `400 uniundata_invalid_param`
+(`amount` — больше остатка; `payment_attempt` — нет такой попытки; `payment_id` — платёж не в `succeeded` /
+`partially_refunded`), `403`, `404 uniundata_order_not_found`.
 
 ## 6.4 Формат ошибок
 
